@@ -9,6 +9,7 @@ set(CMAKE_C_EXTENSIONS OFF)
 add_library(xair STATIC
     src/xair.c
     src/xair_frontend.c
+    src/xair_x86_decode.c
     src/xair_vex.c
 )
 

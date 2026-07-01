@@ -1,5 +1,7 @@
 #include "xair/xair_frontend.h"
 
+#include "xair_x86_decode.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -100,51 +102,6 @@ static int image_offset(const xair_image *image, uint64_t address, size_t *out_o
     }
     *out_offset = (size_t)delta;
     return 1;
-}
-
-static int image_read_u8(const xair_image *image, uint64_t address, uint8_t *out_value) {
-    size_t offset;
-
-    if (out_value == NULL || !image_offset(image, address, &offset)) {
-        return 0;
-    }
-    *out_value = image->bytes[offset];
-    return 1;
-}
-
-static int image_read_le32(const xair_image *image, uint64_t address, uint32_t *out_value) {
-    size_t offset;
-    const uint8_t *p;
-
-    if (out_value == NULL || !image_offset(image, address, &offset) || image->size - offset < 4u) {
-        return 0;
-    }
-    p = image->bytes + offset;
-    *out_value = ((uint32_t)p[0]) |
-        ((uint32_t)p[1] << 8u) |
-        ((uint32_t)p[2] << 16u) |
-        ((uint32_t)p[3] << 24u);
-    return 1;
-}
-
-static int image_read_le64(const xair_image *image, uint64_t address, uint64_t *out_value) {
-    uint32_t lo;
-    uint32_t hi;
-
-    if (out_value == NULL || !image_read_le32(image, address, &lo) ||
-        !image_read_le32(image, address + 4u, &hi)) {
-        return 0;
-    }
-    *out_value = ((uint64_t)lo) | ((uint64_t)hi << 32u);
-    return 1;
-}
-
-static int64_t sign_extend8(uint8_t value) {
-    return (int64_t)(int8_t)value;
-}
-
-static int64_t sign_extend32(uint32_t value) {
-    return (int64_t)(int32_t)value;
 }
 
 static xair_status x86_ensure_reg(
@@ -519,164 +476,6 @@ static xair_status x86_finish_direct_cbranch(
     return x86_finish_block(state);
 }
 
-static int x86_decode_modrm(uint8_t byte, uint8_t *mod, uint8_t *reg, uint8_t *rm) {
-    if (mod == NULL || reg == NULL || rm == NULL) {
-        return 0;
-    }
-    *mod = (uint8_t)(byte >> 6u);
-    *reg = (uint8_t)((byte >> 3u) & 7u);
-    *rm = (uint8_t)(byte & 7u);
-    return 1;
-}
-
-static xair_status x86_lift_modrm_move(
-    x86_lift_state *state,
-    uint8_t opcode,
-    uint8_t rex,
-    uint64_t inst_start,
-    uint64_t *pc) {
-    uint8_t modrm;
-    uint8_t mod;
-    uint8_t reg_field;
-    uint8_t rm_field;
-    xair_x86_reg reg;
-    xair_x86_reg rm;
-    xair_status status;
-
-    if ((rex & 8u) == 0) {
-        return x86_finish_unsupported(state, inst_start, opcode);
-    }
-    if (!image_read_u8(state->image, *pc, &modrm)) {
-        return XAIR_ERR_RANGE;
-    }
-    ++*pc;
-    (void)x86_decode_modrm(modrm, &mod, &reg_field, &rm_field);
-    reg = (xair_x86_reg)(reg_field + ((rex & 4u) != 0 ? 8u : 0u));
-    rm = (xair_x86_reg)(rm_field + ((rex & 1u) != 0 ? 8u : 0u));
-
-    if (mod == 3u) {
-        xair_value_id src;
-
-        if (opcode == 0x8bu) {
-            status = x86_ensure_reg(state, rm, &src);
-            if (status != XAIR_OK) {
-                return status;
-            }
-            x86_write_reg(state, reg, src);
-        } else {
-            status = x86_ensure_reg(state, reg, &src);
-            if (status != XAIR_OK) {
-                return status;
-            }
-            x86_write_reg(state, rm, src);
-        }
-        state->pc = *pc;
-        ++state->instructions;
-        return XAIR_OK;
-    }
-
-    if (mod == 0u && rm_field == 5u && (rex & 1u) == 0) {
-        uint32_t raw_disp;
-        uint64_t next_pc;
-        uint64_t address;
-
-        if (!image_read_le32(state->image, *pc, &raw_disp)) {
-            return XAIR_ERR_RANGE;
-        }
-        *pc += 4u;
-        next_pc = *pc;
-        address = (uint64_t)((int64_t)next_pc + sign_extend32(raw_disp));
-        if (opcode == 0x8bu) {
-            status = x86_lift_rip_load(state, reg, address);
-        } else {
-            status = x86_lift_rip_store(state, reg, address);
-        }
-        if (status != XAIR_OK) {
-            return status;
-        }
-        state->pc = *pc;
-        ++state->instructions;
-        return XAIR_OK;
-    }
-
-    return x86_finish_unsupported(state, inst_start, opcode);
-}
-
-static xair_status x86_lift_modrm_alu(
-    x86_lift_state *state,
-    uint8_t opcode,
-    uint8_t rex,
-    uint64_t inst_start,
-    uint64_t *pc) {
-    uint8_t modrm;
-    uint8_t mod;
-    uint8_t reg_field;
-    uint8_t rm_field;
-    xair_x86_reg reg;
-    xair_x86_reg rm;
-    xair_x86_reg dst;
-    xair_x86_reg src;
-    xair_status status;
-
-    if ((rex & 8u) == 0) {
-        return x86_finish_unsupported(state, inst_start, opcode);
-    }
-    if (!image_read_u8(state->image, *pc, &modrm)) {
-        return XAIR_ERR_RANGE;
-    }
-    ++*pc;
-    (void)x86_decode_modrm(modrm, &mod, &reg_field, &rm_field);
-    if (mod != 3u) {
-        return x86_finish_unsupported(state, inst_start, opcode);
-    }
-    reg = (xair_x86_reg)(reg_field + ((rex & 4u) != 0 ? 8u : 0u));
-    rm = (xair_x86_reg)(rm_field + ((rex & 1u) != 0 ? 8u : 0u));
-
-    switch (opcode) {
-    case 0x01u:
-        dst = rm;
-        src = reg;
-        status = x86_lift_add_sub(state, XAIR_OP_ADD, XAIR_OP_FLAGS_ADD, dst, src);
-        break;
-    case 0x03u:
-        dst = reg;
-        src = rm;
-        status = x86_lift_add_sub(state, XAIR_OP_ADD, XAIR_OP_FLAGS_ADD, dst, src);
-        break;
-    case 0x29u:
-        dst = rm;
-        src = reg;
-        status = x86_lift_add_sub(state, XAIR_OP_SUB, XAIR_OP_FLAGS_SUB, dst, src);
-        break;
-    case 0x2bu:
-        dst = reg;
-        src = rm;
-        status = x86_lift_add_sub(state, XAIR_OP_SUB, XAIR_OP_FLAGS_SUB, dst, src);
-        break;
-    case 0x39u:
-        status = x86_lift_cmp(state, rm, reg);
-        break;
-    case 0x3bu:
-        status = x86_lift_cmp(state, reg, rm);
-        break;
-    case 0x85u:
-        status = x86_lift_test(state, rm, reg);
-        break;
-    default:
-        status = XAIR_ERR_UNSUPPORTED;
-        break;
-    }
-    if (status == XAIR_ERR_UNSUPPORTED) {
-        return x86_finish_unsupported(state, inst_start, opcode);
-    }
-    if (status != XAIR_OK) {
-        return status;
-    }
-    state->pc = *pc;
-    ++state->instructions;
-    return XAIR_OK;
-}
-
 static xair_status x86_condition_from_zf(
     x86_lift_state *state,
     int want_zero,
@@ -706,153 +505,189 @@ static xair_status x86_condition_from_zf(
         out_condition);
 }
 
-static xair_status x86_lift_one(x86_lift_state *state, int *out_done) {
-    uint64_t inst_start = state->pc;
-    uint64_t pc = state->pc;
-    uint8_t rex = 0;
-    uint8_t opcode;
-
-    *out_done = 0;
-    if (!image_read_u8(state->image, pc, &opcode)) {
-        return XAIR_ERR_RANGE;
+static int x86_get_reg_operand(
+    const xair_x86_decoded_inst *inst,
+    size_t index,
+    xair_x86_reg *out_reg) {
+    if (inst == NULL || out_reg == NULL || index >= inst->operand_count ||
+        inst->operands[index].kind != XAIR_X86_OPERAND_REGISTER) {
+        return 0;
     }
-    while (opcode >= 0x40u && opcode <= 0x4fu) {
-        rex = opcode;
-        ++pc;
-        if (!image_read_u8(state->image, pc, &opcode)) {
-            return XAIR_ERR_RANGE;
-        }
-    }
-    ++pc;
+    *out_reg = inst->operands[index].value.reg;
+    return 1;
+}
 
-    if (opcode >= 0xb8u && opcode <= 0xbfu) {
-        uint64_t imm;
-        xair_x86_reg dst;
+static int x86_get_imm_operand(
+    const xair_x86_decoded_inst *inst,
+    size_t index,
+    int64_t *out_value) {
+    if (inst == NULL || out_value == NULL || index >= inst->operand_count ||
+        inst->operands[index].kind != XAIR_X86_OPERAND_IMMEDIATE) {
+        return 0;
+    }
+    *out_value = inst->operands[index].value.imm;
+    return 1;
+}
+
+static int x86_get_rip_mem_operand(
+    const xair_x86_decoded_inst *inst,
+    size_t index,
+    int64_t *out_displacement) {
+    if (inst == NULL || out_displacement == NULL || index >= inst->operand_count ||
+        inst->operands[index].kind != XAIR_X86_OPERAND_MEMORY ||
+        inst->operands[index].value.mem.kind != XAIR_X86_MEM_RIP_REL) {
+        return 0;
+    }
+    *out_displacement = inst->operands[index].value.mem.displacement;
+    return 1;
+}
+
+static uint64_t x86_add_i64(uint64_t base, int64_t offset) {
+    if (offset < 0) {
+        return base - (uint64_t)(-offset);
+    }
+    return base + (uint64_t)offset;
+}
+
+static xair_status x86_lift_mov_decoded(
+    x86_lift_state *state,
+    const xair_x86_decoded_inst *inst,
+    uint64_t next_pc) {
+    xair_x86_reg dst;
+    xair_x86_reg src;
+    int64_t imm;
+    int64_t displacement;
+    xair_status status;
+
+    if (x86_get_reg_operand(inst, 0, &dst) && x86_get_imm_operand(inst, 1, &imm)) {
         xair_value_id value;
-        xair_status status;
 
-        if ((rex & 8u) == 0) {
-            return x86_finish_unsupported(state, inst_start, opcode);
-        }
-        if (!image_read_le64(state->image, pc, &imm)) {
-            return XAIR_ERR_RANGE;
-        }
-        pc += 8u;
-        dst = (xair_x86_reg)((opcode - 0xb8u) + ((rex & 1u) != 0 ? 8u : 0u));
-        status = x86_build_const_u64(state, xair_type_i(64), imm, xair_x86_reg_name(dst), &value);
+        status = x86_build_const_u64(state, xair_type_i(64), (uint64_t)imm, xair_x86_reg_name(dst), &value);
         if (status != XAIR_OK) {
             return status;
         }
         x86_write_reg(state, dst, value);
-        state->pc = pc;
-        ++state->instructions;
         return XAIR_OK;
     }
+    if (x86_get_reg_operand(inst, 0, &dst) && x86_get_reg_operand(inst, 1, &src)) {
+        xair_value_id value;
 
-    switch (opcode) {
-    case 0x8bu:
-    case 0x89u:
-        return x86_lift_modrm_move(state, opcode, rex, inst_start, &pc);
-    case 0x01u:
-    case 0x03u:
-    case 0x29u:
-    case 0x2bu:
-    case 0x39u:
-    case 0x3bu:
-    case 0x85u:
-        return x86_lift_modrm_alu(state, opcode, rex, inst_start, &pc);
-    case 0xebu: {
-        uint8_t rel;
-        uint64_t target;
-
-        if (!image_read_u8(state->image, pc, &rel)) {
-            return XAIR_ERR_RANGE;
+        status = x86_ensure_reg(state, src, &value);
+        if (status != XAIR_OK) {
+            return status;
         }
-        pc += 1u;
-        target = (uint64_t)((int64_t)pc + sign_extend8(rel));
-        state->pc = pc;
+        x86_write_reg(state, dst, value);
+        return XAIR_OK;
+    }
+    if (x86_get_reg_operand(inst, 0, &dst) && x86_get_rip_mem_operand(inst, 1, &displacement)) {
+        return x86_lift_rip_load(state, dst, x86_add_i64(next_pc, displacement));
+    }
+    if (x86_get_rip_mem_operand(inst, 0, &displacement) && x86_get_reg_operand(inst, 1, &src)) {
+        return x86_lift_rip_store(state, src, x86_add_i64(next_pc, displacement));
+    }
+    return XAIR_ERR_UNSUPPORTED;
+}
+
+static xair_status x86_lift_alu_decoded(x86_lift_state *state, const xair_x86_decoded_inst *inst) {
+    xair_x86_reg dst;
+    xair_x86_reg src;
+
+    if (!x86_get_reg_operand(inst, 0, &dst) || !x86_get_reg_operand(inst, 1, &src)) {
+        return XAIR_ERR_UNSUPPORTED;
+    }
+    switch (inst->mnemonic) {
+    case XAIR_X86_MNEMONIC_ADD:
+        return x86_lift_add_sub(state, XAIR_OP_ADD, XAIR_OP_FLAGS_ADD, dst, src);
+    case XAIR_X86_MNEMONIC_SUB:
+        return x86_lift_add_sub(state, XAIR_OP_SUB, XAIR_OP_FLAGS_SUB, dst, src);
+    case XAIR_X86_MNEMONIC_CMP:
+        return x86_lift_cmp(state, dst, src);
+    case XAIR_X86_MNEMONIC_TEST:
+        return x86_lift_test(state, dst, src);
+    default:
+        return XAIR_ERR_UNSUPPORTED;
+    }
+}
+
+static xair_status x86_lift_one(x86_lift_state *state, int *out_done) {
+    uint64_t inst_start = state->pc;
+    uint64_t next_pc;
+    size_t offset;
+    xair_x86_decoded_inst inst;
+    xair_status status;
+
+    *out_done = 0;
+    if (!image_offset(state->image, inst_start, &offset)) {
+        return XAIR_ERR_RANGE;
+    }
+    status = xair_x86_decode64(state->image->bytes + offset, state->image->size - offset, &inst);
+    if (status == XAIR_ERR_UNSUPPORTED) {
+        return x86_finish_unsupported(state, inst_start, inst.raw_opcode);
+    }
+    if (status != XAIR_OK) {
+        return status;
+    }
+    next_pc = inst_start + inst.length;
+
+    switch (inst.mnemonic) {
+    case XAIR_X86_MNEMONIC_MOV:
+        status = x86_lift_mov_decoded(state, &inst, next_pc);
+        break;
+    case XAIR_X86_MNEMONIC_ADD:
+    case XAIR_X86_MNEMONIC_SUB:
+    case XAIR_X86_MNEMONIC_CMP:
+    case XAIR_X86_MNEMONIC_TEST:
+        status = x86_lift_alu_decoded(state, &inst);
+        break;
+    case XAIR_X86_MNEMONIC_JMP: {
+        int64_t rel;
+
+        if (!x86_get_imm_operand(&inst, 0, &rel)) {
+            return x86_finish_unsupported(state, inst_start, inst.raw_opcode);
+        }
+        state->pc = next_pc;
         ++state->instructions;
         *out_done = 1;
-        return x86_finish_direct_jump(state, target);
+        return x86_finish_direct_jump(state, x86_add_i64(next_pc, rel));
     }
-    case 0xe9u: {
-        uint32_t rel;
-        uint64_t target;
-
-        if (!image_read_le32(state->image, pc, &rel)) {
-            return XAIR_ERR_RANGE;
-        }
-        pc += 4u;
-        target = (uint64_t)((int64_t)pc + sign_extend32(rel));
-        state->pc = pc;
-        ++state->instructions;
-        *out_done = 1;
-        return x86_finish_direct_jump(state, target);
-    }
-    case 0x74u:
-    case 0x75u: {
-        uint8_t rel;
-        uint64_t target;
+    case XAIR_X86_MNEMONIC_JZ:
+    case XAIR_X86_MNEMONIC_JNZ: {
+        int64_t rel;
         xair_value_id condition;
-        xair_status status;
 
-        if (!image_read_u8(state->image, pc, &rel)) {
-            return XAIR_ERR_RANGE;
+        if (!x86_get_imm_operand(&inst, 0, &rel)) {
+            return x86_finish_unsupported(state, inst_start, inst.raw_opcode);
         }
-        pc += 1u;
-        status = x86_condition_from_zf(state, opcode == 0x74u, &condition);
+        status = x86_condition_from_zf(state, inst.mnemonic == XAIR_X86_MNEMONIC_JZ, &condition);
         if (status == XAIR_ERR_UNSUPPORTED) {
-            return x86_finish_unsupported(state, inst_start, opcode);
+            return x86_finish_unsupported(state, inst_start, inst.raw_opcode);
         }
         if (status != XAIR_OK) {
             return status;
         }
-        target = (uint64_t)((int64_t)pc + sign_extend8(rel));
-        state->pc = pc;
+        state->pc = next_pc;
         ++state->instructions;
         *out_done = 1;
-        return x86_finish_direct_cbranch(state, target, pc, condition);
+        return x86_finish_direct_cbranch(state, x86_add_i64(next_pc, rel), next_pc, condition);
     }
-    case 0x0fu: {
-        uint8_t opcode2;
-
-        if (!image_read_u8(state->image, pc, &opcode2)) {
-            return XAIR_ERR_RANGE;
-        }
-        ++pc;
-        if (opcode2 == 0x84u || opcode2 == 0x85u) {
-            uint32_t rel;
-            uint64_t target;
-            xair_value_id condition;
-            xair_status status;
-
-            if (!image_read_le32(state->image, pc, &rel)) {
-                return XAIR_ERR_RANGE;
-            }
-            pc += 4u;
-            status = x86_condition_from_zf(state, opcode2 == 0x84u, &condition);
-            if (status == XAIR_ERR_UNSUPPORTED) {
-                return x86_finish_unsupported(state, inst_start, opcode);
-            }
-            if (status != XAIR_OK) {
-                return status;
-            }
-            target = (uint64_t)((int64_t)pc + sign_extend32(rel));
-            state->pc = pc;
-            ++state->instructions;
-            *out_done = 1;
-            return x86_finish_direct_cbranch(state, target, pc, condition);
-        }
-        return x86_finish_unsupported(state, inst_start, opcode);
-    }
-    case 0xc3u:
-        state->pc = pc;
+    case XAIR_X86_MNEMONIC_RET:
+        state->pc = next_pc;
         ++state->instructions;
         *out_done = 1;
         return x86_finish_return(state);
     default:
-        return x86_finish_unsupported(state, inst_start, opcode);
+        return x86_finish_unsupported(state, inst_start, inst.raw_opcode);
     }
+
+    if (status == XAIR_ERR_UNSUPPORTED) {
+        return x86_finish_unsupported(state, inst_start, inst.raw_opcode);
+    }
+    if (status != XAIR_OK) {
+        return status;
+    }
+    state->pc = next_pc;
+    ++state->instructions;
+    return XAIR_OK;
 }
 
 static xair_status lift_x86_64_basic_block(

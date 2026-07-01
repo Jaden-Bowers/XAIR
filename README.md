@@ -34,3 +34,9 @@ build/Debug/xair_lift_raw.exe <raw-binary> <base> <entry> [max-instructions]
 This tool expects a raw byte blob, not a PE/ELF/Mach-O file. It prints lift
 metadata and the generated XAIR block. CFG construction is intentionally left
 for a later separate project that consumes this frontend.
+
+## Attribution
+
+The private x86 decoder stub is shaped after Zydis' decoded-instruction and
+typed-operand API style, but does not vendor Zydis source code or generated
+tables. Zydis is MIT licensed by Florian Bernd, Joel Höner, and contributors.

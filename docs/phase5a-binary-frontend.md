@@ -8,6 +8,8 @@ builder to consume.
 
 - Raw byte image abstraction with base-address translation.
 - Architecture selection for x86-64.
+- Private Zydis-inspired decoded-instruction/operand boundary without vendoring
+  Zydis source or generated tables.
 - Basic-block lifter API that creates XAIR for one block.
 - x86-64 subset:
   - REX prefix handling for 64-bit general-purpose registers.
@@ -34,6 +36,11 @@ intentional. The IR-generator project should be benchmarkable independently from
 CFG recovery. The result record contains target and fallthrough addresses for
 the future CFG project.
 
+The decoder stub uses a Zydis-like separation between decoding and semantic
+lifting: byte parsing produces a small decoded instruction with typed operands,
+and the lifter consumes that shape. This keeps the current dependency footprint
+small while preserving a clean replacement point for a fuller decoder.
+
 Architectural register reads become block parameters lazily. Register writes are
 reported as output values. Memory is also introduced lazily; loads consume the
 current memory token and stores produce a new one.
@@ -44,6 +51,7 @@ results without special cleanup.
 
 ## Next Step After This Phase
 
-Add a real decoder dependency, preferably Zydis, behind the same lifter API.
-The current subset is for validating the frontend boundary and benchmark
-harnesses, not for claiming complete x86 coverage.
+Expand the private decoder stub into a table-driven decoder behind the same
+lifter API. Importing Zydis can remain a later option if the dependency tradeoff
+becomes worthwhile. The current subset is for validating the frontend boundary
+and benchmark harnesses, not for claiming complete x86 coverage.

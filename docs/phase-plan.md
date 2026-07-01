@@ -85,7 +85,7 @@ Exit criterion:
 ### Phase 5B: Full Native x86-64 Lifter
 
 Scope:
-- Zydis decoder.
+- Zydis-inspired or table-driven decoder, keeping direct Zydis import optional.
 - REX, ModR/M, SIB, RIP-relative addressing.
 - Arithmetic, logic, moves, branches, calls, returns, loads, stores, `CMOVcc`.
 - Lazy flags through `flags_*` summaries.

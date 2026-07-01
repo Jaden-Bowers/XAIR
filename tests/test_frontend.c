@@ -154,6 +154,29 @@ static void test_lift_rip_relative_load_executes(void) {
     xair_module_destroy(module);
 }
 
+static void test_lift_direct_jump_metadata(void) {
+    static const uint8_t bytes[] = {0xeb, 0xfe};
+    xair_image image;
+    xair_lift_options options;
+    xair_lift_result lift;
+    xair_error error;
+    xair_module *module = NULL;
+
+    require_ok(xair_image_init(&image, bytes, sizeof(bytes), 0x4000));
+    memset(&options, 0, sizeof(options));
+    options.arch = XAIR_ARCH_X86_64;
+    options.address = 0x4000;
+
+    require_ok(xair_module_create(&module));
+    require_ok(xair_lift_basic_block(module, &image, &options, &lift));
+    assert(lift.end_kind == XAIR_LIFT_END_DIRECT_JUMP);
+    assert(lift.next == 0x4002);
+    assert(lift.target == 0x4000);
+    require_ok(xair_verify_module(module, &error));
+
+    xair_module_destroy(module);
+}
+
 static void test_lift_unsupported_is_explicit(void) {
     static const uint8_t bytes[] = {0x0f, 0xa2};
     xair_image image;
@@ -177,10 +200,35 @@ static void test_lift_unsupported_is_explicit(void) {
     xair_module_destroy(module);
 }
 
+static void test_lift_non_rex64_form_is_unsupported(void) {
+    static const uint8_t bytes[] = {0xb8, 0x01, 0x00, 0x00, 0x00};
+    xair_image image;
+    xair_lift_options options;
+    xair_lift_result lift;
+    xair_error error;
+    xair_module *module = NULL;
+
+    require_ok(xair_image_init(&image, bytes, sizeof(bytes), 0x5000));
+    memset(&options, 0, sizeof(options));
+    options.arch = XAIR_ARCH_X86_64;
+    options.address = 0x5000;
+
+    require_ok(xair_module_create(&module));
+    require_ok(xair_lift_basic_block(module, &image, &options, &lift));
+    assert(lift.end_kind == XAIR_LIFT_END_UNSUPPORTED);
+    assert(lift.unsupported_address == 0x5000);
+    assert(lift.unsupported_opcode == 0xb8);
+    require_ok(xair_verify_module(module, &error));
+
+    xair_module_destroy(module);
+}
+
 int main(void) {
     test_lift_mov_add_ret_executes();
     test_lift_jz_metadata_and_condition();
     test_lift_rip_relative_load_executes();
+    test_lift_direct_jump_metadata();
     test_lift_unsupported_is_explicit();
+    test_lift_non_rex64_form_is_unsupported();
     return 0;
 }
