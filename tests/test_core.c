@@ -1,4 +1,5 @@
 #include "xair/xair.h"
+#include "xair/xair_vex.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -316,6 +317,97 @@ static void test_exec_step_limit(void) {
     xair_module_destroy(module);
 }
 
+static void test_vex_adapter_register_memory_sequence(void) {
+    xair_module *module = NULL;
+    xair_vex_adapter *adapter = NULL;
+    xair_exec_state *state = NULL;
+    xair_exec_result result;
+    xair_block_id entry;
+    xair_value_id mem0;
+    xair_value_id reg;
+    xair_value_id one;
+    xair_value_id sum;
+    xair_value_id addr;
+    xair_value_id loaded;
+
+    require_ok(xair_module_create(&module));
+    require_ok(xair_block_create(module, "entry", &entry));
+    require_ok(xair_block_add_param(module, entry, xair_type_mem(0, 64), "m0", &mem0));
+    require_ok(xair_vex_adapter_create(module, entry, mem0, &adapter));
+
+    require_ok(xair_vex_get_reg(adapter, 16, xair_type_i(64), "r16", &reg));
+    require_ok(xair_vex_emit_const(adapter, 1, xair_type_i(64), 1, "one"));
+    require_ok(xair_vex_get_tmp(adapter, 1, &one));
+    require_ok(xair_vex_emit_binop(adapter, 2, "Iop_Add64", reg, one, "sum"));
+    require_ok(xair_vex_get_tmp(adapter, 2, &sum));
+    require_ok(xair_vex_put_reg(adapter, 16, sum));
+
+    require_ok(xair_vex_emit_const(adapter, 3, xair_type_addr(64), 0x2000, "addr"));
+    require_ok(xair_vex_get_tmp(adapter, 3, &addr));
+    require_ok(xair_vex_emit_store(adapter, addr, sum, XAIR_ENDIAN_LE, "m1"));
+    require_ok(xair_vex_emit_load(adapter, 4, xair_type_i(64), addr, XAIR_ENDIAN_LE, "loaded"));
+    require_ok(xair_vex_get_tmp(adapter, 4, &loaded));
+    require_ok(xair_vex_finish_return(adapter, &loaded, 1));
+
+    require_ok(xair_exec_state_create(module, &state));
+    require_ok(xair_exec_set_param(state, mem0, xair_exec_mem(0, 64)));
+    require_ok(xair_exec_set_param(state, reg, xair_exec_i(64, 41)));
+    require_ok(xair_exec_run(module, entry, state, 16, &result));
+    assert(result.kind == XAIR_EXEC_HALTED_RETURN);
+    assert(result.return_count == 1);
+    assert(result.returns[0].lo == 42);
+
+    xair_exec_state_destroy(state);
+    xair_vex_adapter_destroy(adapter);
+    xair_module_destroy(module);
+}
+
+static void test_vex_adapter_exit_continuation_carries_state(void) {
+    xair_module *module = NULL;
+    xair_vex_adapter *adapter = NULL;
+    xair_exec_state *state = NULL;
+    xair_exec_result result;
+    xair_error error;
+    xair_block_id entry;
+    xair_block_id side;
+    xair_value_id false_value;
+    xair_value_id seven;
+    xair_value_id five;
+    xair_value_id sum;
+    xair_value_id side_value;
+
+    require_ok(xair_module_create(&module));
+    require_ok(xair_block_create(module, "entry", &entry));
+    require_ok(xair_block_create(module, "side", &side));
+    require_ok(xair_build_const_u64(module, side, xair_type_i(64), 99, "side_value", &side_value));
+    require_ok(xair_set_return(module, side, &side_value, 1));
+
+    require_ok(xair_vex_adapter_create(module, entry, XAIR_INVALID_ID, &adapter));
+    require_ok(xair_vex_emit_const(adapter, 0, xair_type_i(1), 0, "cond"));
+    require_ok(xair_vex_get_tmp(adapter, 0, &false_value));
+    require_ok(xair_vex_emit_const(adapter, 1, xair_type_i(64), 7, "seven"));
+    require_ok(xair_vex_get_tmp(adapter, 1, &seven));
+    require_ok(xair_vex_emit_exit(adapter, false_value, side, NULL, 0, "cont"));
+
+    require_ok(xair_vex_get_tmp(adapter, 1, &seven));
+    require_ok(xair_vex_emit_const(adapter, 2, xair_type_i(64), 5, "five"));
+    require_ok(xair_vex_get_tmp(adapter, 2, &five));
+    require_ok(xair_vex_emit_binop(adapter, 3, "Iop_Add64", seven, five, "sum"));
+    require_ok(xair_vex_get_tmp(adapter, 3, &sum));
+    require_ok(xair_vex_finish_return(adapter, &sum, 1));
+
+    require_ok(xair_verify_module(module, &error));
+    require_ok(xair_exec_state_create(module, &state));
+    require_ok(xair_exec_run(module, entry, state, 16, &result));
+    assert(result.kind == XAIR_EXEC_HALTED_RETURN);
+    assert(result.return_count == 1);
+    assert(result.returns[0].lo == 12);
+
+    xair_exec_state_destroy(state);
+    xair_vex_adapter_destroy(adapter);
+    xair_module_destroy(module);
+}
+
 int main(void) {
     test_flags_and_branch();
     test_memory_versions();
@@ -327,5 +419,7 @@ int main(void) {
     test_exec_flags_branch();
     test_exec_memory_roundtrip();
     test_exec_step_limit();
+    test_vex_adapter_register_memory_sequence();
+    test_vex_adapter_exit_continuation_carries_state();
     return 0;
 }

@@ -8,6 +8,7 @@ set(CMAKE_C_EXTENSIONS OFF)
 
 add_library(xair STATIC
     src/xair.c
+    src/xair_vex.c
 )
 
 target_include_directories(xair
@@ -30,4 +31,3 @@ add_executable(xair_core_tests
 target_link_libraries(xair_core_tests PRIVATE xair)
 
 add_test(NAME xair_core_tests COMMAND xair_core_tests)
-
