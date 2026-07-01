@@ -1,0 +1,204 @@
+#ifndef XAIR_XAIR_H
+#define XAIR_XAIR_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define XAIR_INVALID_ID UINT32_MAX
+
+typedef uint32_t xair_value_id;
+typedef uint32_t xair_block_id;
+typedef uint32_t xair_op_id;
+
+typedef enum {
+    XAIR_OK = 0,
+    XAIR_ERR_OOM,
+    XAIR_ERR_BAD_ARG,
+    XAIR_ERR_RANGE,
+    XAIR_ERR_VERIFY
+} xair_status;
+
+typedef enum {
+    XAIR_TYPE_INVALID = 0,
+    XAIR_TYPE_VOID,
+    XAIR_TYPE_INT,
+    XAIR_TYPE_ADDR,
+    XAIR_TYPE_FLAGS,
+    XAIR_TYPE_MEM,
+    XAIR_TYPE_LABEL8,
+    XAIR_TYPE_LABELSET
+} xair_type_kind;
+
+typedef struct {
+    xair_type_kind kind;
+    uint16_t bits;
+    uint16_t aux;
+} xair_type;
+
+typedef enum {
+    XAIR_ENDIAN_LE = 0,
+    XAIR_ENDIAN_BE = 1
+} xair_endian;
+
+typedef enum {
+    XAIR_OP_CONST_U64 = 0,
+    XAIR_OP_ADD,
+    XAIR_OP_SUB,
+    XAIR_OP_MUL,
+    XAIR_OP_AND,
+    XAIR_OP_OR,
+    XAIR_OP_XOR,
+    XAIR_OP_SHL,
+    XAIR_OP_LSHR,
+    XAIR_OP_ASHR,
+    XAIR_OP_EQ,
+    XAIR_OP_NE,
+    XAIR_OP_ULT,
+    XAIR_OP_ULE,
+    XAIR_OP_SLT,
+    XAIR_OP_SLE,
+    XAIR_OP_ZEXT,
+    XAIR_OP_SEXT,
+    XAIR_OP_TRUNC,
+    XAIR_OP_CONCAT,
+    XAIR_OP_ADDR_ADD,
+    XAIR_OP_ADDR_SUB,
+    XAIR_OP_FLAGS_ADD,
+    XAIR_OP_FLAGS_SUB,
+    XAIR_OP_FLAG_ZF,
+    XAIR_OP_FLAG_CF,
+    XAIR_OP_FLAG_OF,
+    XAIR_OP_FLAG_SF,
+    XAIR_OP_LOAD,
+    XAIR_OP_STORE
+} xair_opcode;
+
+typedef struct {
+    xair_status status;
+    xair_block_id block;
+    xair_value_id value;
+    char message[192];
+} xair_error;
+
+typedef struct xair_module xair_module;
+
+xair_type xair_type_void(void);
+xair_type xair_type_i(uint16_t bits);
+xair_type xair_type_addr(uint16_t bits);
+xair_type xair_type_flags(uint16_t count);
+xair_type xair_type_mem(uint16_t space, uint16_t addr_bits);
+xair_type xair_type_label8(void);
+xair_type xair_type_labelset(void);
+int xair_type_equal(xair_type lhs, xair_type rhs);
+int xair_type_is_valid(xair_type type);
+
+const char *xair_status_name(xair_status status);
+const char *xair_opcode_name(xair_opcode opcode);
+
+xair_status xair_module_create(xair_module **out_module);
+void xair_module_destroy(xair_module *module);
+
+size_t xair_module_block_count(const xair_module *module);
+size_t xair_module_value_count(const xair_module *module);
+size_t xair_module_op_count(const xair_module *module);
+
+xair_status xair_block_create(
+    xair_module *module,
+    const char *name,
+    xair_block_id *out_block);
+
+xair_status xair_block_add_param(
+    xair_module *module,
+    xair_block_id block,
+    xair_type type,
+    const char *name,
+    xair_value_id *out_value);
+
+xair_status xair_build_const_u64(
+    xair_module *module,
+    xair_block_id block,
+    xair_type type,
+    uint64_t value,
+    const char *name,
+    xair_value_id *out_value);
+
+xair_status xair_build_unary(
+    xair_module *module,
+    xair_block_id block,
+    xair_opcode opcode,
+    xair_type result_type,
+    xair_value_id src,
+    const char *name,
+    xair_value_id *out_value);
+
+xair_status xair_build_binary(
+    xair_module *module,
+    xair_block_id block,
+    xair_opcode opcode,
+    xair_type result_type,
+    xair_value_id lhs,
+    xair_value_id rhs,
+    const char *name,
+    xair_value_id *out_value);
+
+xair_status xair_build_load(
+    xair_module *module,
+    xair_block_id block,
+    xair_type result_type,
+    xair_value_id memory,
+    xair_value_id address,
+    xair_endian endian,
+    const char *name,
+    xair_value_id *out_value);
+
+xair_status xair_build_store(
+    xair_module *module,
+    xair_block_id block,
+    xair_value_id memory,
+    xair_value_id address,
+    xair_value_id data,
+    xair_endian endian,
+    const char *name,
+    xair_value_id *out_memory);
+
+xair_status xair_set_jump(
+    xair_module *module,
+    xair_block_id block,
+    xair_block_id target,
+    const xair_value_id *args,
+    size_t arg_count);
+
+xair_status xair_set_cbranch(
+    xair_module *module,
+    xair_block_id block,
+    xair_value_id condition,
+    xair_block_id true_target,
+    const xair_value_id *true_args,
+    size_t true_arg_count,
+    xair_block_id false_target,
+    const xair_value_id *false_args,
+    size_t false_arg_count);
+
+xair_status xair_set_return(
+    xair_module *module,
+    xair_block_id block,
+    const xair_value_id *values,
+    size_t value_count);
+
+xair_status xair_set_trap(xair_module *module, xair_block_id block, uint32_t code);
+xair_status xair_set_fault(xair_module *module, xair_block_id block, uint32_t code);
+
+xair_type xair_value_type(const xair_module *module, xair_value_id value);
+
+xair_status xair_verify_module(const xair_module *module, xair_error *error);
+xair_status xair_format_module(const xair_module *module, char *buffer, size_t buffer_size);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
