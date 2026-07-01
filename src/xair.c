@@ -424,6 +424,8 @@ const char *xair_opcode_name(xair_opcode opcode) {
     case XAIR_OP_CONCAT: return "concat";
     case XAIR_OP_ADDR_ADD: return "addr_add";
     case XAIR_OP_ADDR_SUB: return "addr_sub";
+    case XAIR_OP_INT_TO_ADDR: return "int_to_addr";
+    case XAIR_OP_ADDR_TO_INT: return "addr_to_int";
     case XAIR_OP_FLAGS_ADD: return "flags_add";
     case XAIR_OP_FLAGS_SUB: return "flags_sub";
     case XAIR_OP_FLAG_ZF: return "flag_zf";
@@ -519,7 +521,7 @@ xair_status xair_block_add_param(
         return XAIR_ERR_BAD_ARG;
     }
     bb = &module->blocks[block];
-    if (bb->op_count != 0 || bb->term.kind != XAIR_TERM_NONE) {
+    if (bb->term.kind != XAIR_TERM_NONE) {
         return XAIR_ERR_BAD_ARG;
     }
     status = add_value(module, block, type, name, &value);
@@ -821,6 +823,16 @@ static xair_status verify_unary_op(const xair_module *module, const xair_op_rec 
             return set_error(error, block, op->dst, "trunc requires narrowing integer result");
         }
         return XAIR_OK;
+    case XAIR_OP_INT_TO_ADDR:
+        if (!is_int(src) || !is_addr(out) || src.bits != out.bits) {
+            return set_error(error, block, op->dst, "int_to_addr requires iN -> addrN");
+        }
+        return XAIR_OK;
+    case XAIR_OP_ADDR_TO_INT:
+        if (!is_addr(src) || !is_int(out) || src.bits != out.bits) {
+            return set_error(error, block, op->dst, "addr_to_int requires addrN -> iN");
+        }
+        return XAIR_OK;
     case XAIR_OP_FLAG_ZF:
     case XAIR_OP_FLAG_CF:
     case XAIR_OP_FLAG_OF:
@@ -880,6 +892,8 @@ static xair_status verify_op(const xair_module *module, const xair_op_rec *op, x
     case XAIR_OP_ZEXT:
     case XAIR_OP_SEXT:
     case XAIR_OP_TRUNC:
+    case XAIR_OP_INT_TO_ADDR:
+    case XAIR_OP_ADDR_TO_INT:
     case XAIR_OP_FLAG_ZF:
     case XAIR_OP_FLAG_CF:
     case XAIR_OP_FLAG_OF:
@@ -1317,6 +1331,14 @@ static int fold_constant_op(xair_module *module, xair_op_rec *op) {
             folded = lhs;
         }
         fold_to_const(op, folded, out);
+        return 1;
+
+    case XAIR_OP_INT_TO_ADDR:
+    case XAIR_OP_ADDR_TO_INT:
+        if (!(is_int(out) || is_addr(out)) || out.bits > 64 || !const_u64_value(module, op->src[0], &lhs)) {
+            return 0;
+        }
+        fold_to_const(op, lhs, out);
         return 1;
 
     case XAIR_OP_CONCAT:
@@ -2337,6 +2359,8 @@ static xair_status exec_unary_op(
     switch (op->opcode) {
     case XAIR_OP_ZEXT:
     case XAIR_OP_TRUNC:
+    case XAIR_OP_INT_TO_ADDR:
+    case XAIR_OP_ADDR_TO_INT:
         if (!exec_scalar_u64_type(out) || !exec_scalar_u64_type(src.type)) {
             return XAIR_ERR_UNSUPPORTED;
         }

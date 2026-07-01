@@ -127,6 +127,12 @@ static void print_lift_result(const xair_lift_result *result) {
     if (result->memory_out != XAIR_INVALID_ID) {
         printf("lift.memory_out=%%%u\n", (unsigned)result->memory_out);
     }
+    for (i = 0; i < result->input_reg_count; ++i) {
+        printf(
+            "lift.input.%s=%%%u\n",
+            xair_x86_reg_name(result->input_regs[i].reg),
+            (unsigned)result->input_regs[i].value);
+    }
     for (i = 0; i < result->output_reg_count; ++i) {
         printf(
             "lift.output.%s=%%%u\n",

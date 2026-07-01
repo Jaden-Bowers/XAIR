@@ -75,6 +75,8 @@ typedef struct {
     xair_value_id memory_in;
     xair_value_id memory_out;
     xair_value_id branch_condition;
+    size_t input_reg_count;
+    xair_lift_reg_value input_regs[XAIR_LIFT_MAX_REG_OUTPUTS];
     size_t output_reg_count;
     xair_lift_reg_value output_regs[XAIR_LIFT_MAX_REG_OUTPUTS];
     size_t return_count;

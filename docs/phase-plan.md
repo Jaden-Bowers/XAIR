@@ -82,18 +82,24 @@ Exit criterion:
 - A raw byte blob can be lifted into verifier-valid XAIR.
 - Lifting can be benchmarked separately from CFG construction.
 
-### Phase 5B: Full Native x86-64 Lifter
+### Phase 5B: Benchmark-Ready Native x86-64 Lifter Subset
+
+Goal: reach a benchmarkable native-lifter subset before building the benchmark
+harness.
 
 Scope:
 - Zydis-inspired or table-driven decoder, keeping direct Zydis import optional.
 - REX, ModR/M, SIB, RIP-relative addressing.
-- Arithmetic, logic, moves, branches, calls, returns, loads, stores, `CMOVcc`.
-- Lazy flags through `flags_*` summaries.
+- Arithmetic, logic, moves, branches, returns, loads, stores, `lea`, `push`,
+  and `pop`.
+- Lazy flags through `flags_*` summaries and direct ZF materialization.
+- Lift-result metadata for input registers, output registers, memory tokens,
+  and branch targets.
 
 Exit criterion:
-- Differential tests agree with VEX and hardware/QEMU on bounded instruction
-  streams.
-- Lift latency and IR inflation improve over VEX on the benchmark set.
+- Compiler-style raw basic blocks lift into verifier-valid XAIR.
+- Concrete execution checks pass for stack and branch-heavy samples.
+- The next phase can focus on benchmarking XAIR against VEX and other IRs.
 
 ## Phase 6: Symbolic And Taint Backends
 

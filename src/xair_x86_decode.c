@@ -44,23 +44,8 @@ static int64_t decode_sign_extend32(uint32_t value) {
     return (int64_t)(int32_t)value;
 }
 
-static void decode_set_reg(xair_x86_operand *operand, xair_x86_reg reg) {
-    operand->kind = XAIR_X86_OPERAND_REGISTER;
-    operand->size_bits = 64;
-    operand->value.reg = reg;
-}
-
-static void decode_set_rip_mem(xair_x86_operand *operand, int64_t displacement) {
-    operand->kind = XAIR_X86_OPERAND_MEMORY;
-    operand->size_bits = 64;
-    operand->value.mem.kind = XAIR_X86_MEM_RIP_REL;
-    operand->value.mem.displacement = displacement;
-}
-
-static void decode_set_imm(xair_x86_operand *operand, uint16_t bits, int64_t value) {
-    operand->kind = XAIR_X86_OPERAND_IMMEDIATE;
-    operand->size_bits = bits;
-    operand->value.imm = value;
+static xair_x86_reg decode_reg(uint8_t field, uint8_t rex_bit) {
+    return (xair_x86_reg)(field + (rex_bit != 0 ? 8u : 0u));
 }
 
 static void decode_modrm(uint8_t byte, uint8_t *mod, uint8_t *reg, uint8_t *rm) {
@@ -69,8 +54,47 @@ static void decode_modrm(uint8_t byte, uint8_t *mod, uint8_t *reg, uint8_t *rm) 
     *rm = (uint8_t)(byte & 7u);
 }
 
-static xair_x86_reg decode_reg(uint8_t field, uint8_t rex_bit) {
-    return (xair_x86_reg)(field + (rex_bit != 0 ? 8u : 0u));
+static void decode_set_reg(xair_x86_operand *operand, xair_x86_reg reg) {
+    memset(operand, 0, sizeof(*operand));
+    operand->kind = XAIR_X86_OPERAND_REGISTER;
+    operand->size_bits = 64;
+    operand->value.reg = reg;
+}
+
+static void decode_set_imm(xair_x86_operand *operand, uint16_t bits, int64_t value) {
+    memset(operand, 0, sizeof(*operand));
+    operand->kind = XAIR_X86_OPERAND_IMMEDIATE;
+    operand->size_bits = bits;
+    operand->value.imm = value;
+}
+
+static void decode_set_rip_mem(xair_x86_operand *operand, int64_t displacement) {
+    memset(operand, 0, sizeof(*operand));
+    operand->kind = XAIR_X86_OPERAND_MEMORY;
+    operand->size_bits = 64;
+    operand->value.mem.kind = XAIR_X86_MEM_RIP_REL;
+    operand->value.mem.scale = 1;
+    operand->value.mem.displacement = displacement;
+}
+
+static void decode_set_base_index_mem(
+    xair_x86_operand *operand,
+    int has_base,
+    xair_x86_reg base,
+    int has_index,
+    xair_x86_reg index,
+    uint8_t scale,
+    int64_t displacement) {
+    memset(operand, 0, sizeof(*operand));
+    operand->kind = XAIR_X86_OPERAND_MEMORY;
+    operand->size_bits = 64;
+    operand->value.mem.kind = XAIR_X86_MEM_BASE_INDEX;
+    operand->value.mem.has_base = (uint8_t)(has_base != 0);
+    operand->value.mem.base = base;
+    operand->value.mem.has_index = (uint8_t)(has_index != 0);
+    operand->value.mem.index = index;
+    operand->value.mem.scale = scale == 0 ? 1u : scale;
+    operand->value.mem.displacement = displacement;
 }
 
 static xair_status decode_unsupported(
@@ -83,7 +107,136 @@ static xair_status decode_unsupported(
     return XAIR_ERR_UNSUPPORTED;
 }
 
-static xair_status decode_modrm_move(
+static xair_status decode_displacement(
+    const uint8_t *bytes,
+    size_t size,
+    uint8_t mod,
+    size_t *offset,
+    int64_t *out_disp) {
+    uint8_t disp8;
+    uint32_t disp32;
+
+    *out_disp = 0;
+    if (mod == 1u) {
+        if (!decode_read_u8(bytes, size, *offset, &disp8)) {
+            return XAIR_ERR_RANGE;
+        }
+        ++*offset;
+        *out_disp = decode_sign_extend8(disp8);
+    } else if (mod == 2u) {
+        if (!decode_read_le32(bytes, size, *offset, &disp32)) {
+            return XAIR_ERR_RANGE;
+        }
+        *offset += 4u;
+        *out_disp = decode_sign_extend32(disp32);
+    }
+    return XAIR_OK;
+}
+
+static xair_status decode_memory_operand(
+    const uint8_t *bytes,
+    size_t size,
+    uint8_t mod,
+    uint8_t rm_field,
+    uint8_t rex,
+    size_t *offset,
+    xair_x86_operand *out_operand) {
+    int64_t displacement;
+    uint32_t disp32;
+
+    if (mod == 3u) {
+        return XAIR_ERR_BAD_ARG;
+    }
+
+    if (rm_field == 4u) {
+        uint8_t sib;
+        uint8_t scale_bits;
+        uint8_t index_field;
+        uint8_t base_field;
+        int has_base = 1;
+        int has_index = 1;
+        xair_x86_reg base = XAIR_X86_REG_COUNT;
+        xair_x86_reg index = XAIR_X86_REG_COUNT;
+        uint8_t scale;
+
+        if (!decode_read_u8(bytes, size, *offset, &sib)) {
+            return XAIR_ERR_RANGE;
+        }
+        ++*offset;
+        scale_bits = (uint8_t)(sib >> 6u);
+        index_field = (uint8_t)((sib >> 3u) & 7u);
+        base_field = (uint8_t)(sib & 7u);
+        scale = (uint8_t)(1u << scale_bits);
+
+        if (index_field == 4u && (rex & 2u) == 0) {
+            has_index = 0;
+        } else {
+            index = decode_reg(index_field, (uint8_t)(rex & 2u));
+        }
+
+        if (mod == 0u && base_field == 5u) {
+            has_base = 0;
+            if (!decode_read_le32(bytes, size, *offset, &disp32)) {
+                return XAIR_ERR_RANGE;
+            }
+            *offset += 4u;
+            displacement = decode_sign_extend32(disp32);
+        } else {
+            base = decode_reg(base_field, (uint8_t)(rex & 1u));
+            if (decode_displacement(bytes, size, mod, offset, &displacement) != XAIR_OK) {
+                return XAIR_ERR_RANGE;
+            }
+        }
+        decode_set_base_index_mem(
+            out_operand,
+            has_base,
+            base,
+            has_index,
+            index,
+            scale,
+            displacement);
+        return XAIR_OK;
+    }
+
+    if (mod == 0u && rm_field == 5u) {
+        if (!decode_read_le32(bytes, size, *offset, &disp32)) {
+            return XAIR_ERR_RANGE;
+        }
+        *offset += 4u;
+        decode_set_rip_mem(out_operand, decode_sign_extend32(disp32));
+        return XAIR_OK;
+    }
+
+    if (decode_displacement(bytes, size, mod, offset, &displacement) != XAIR_OK) {
+        return XAIR_ERR_RANGE;
+    }
+    decode_set_base_index_mem(
+        out_operand,
+        1,
+        decode_reg(rm_field, (uint8_t)(rex & 1u)),
+        0,
+        XAIR_X86_REG_COUNT,
+        1,
+        displacement);
+    return XAIR_OK;
+}
+
+static xair_status decode_rm_operand(
+    const uint8_t *bytes,
+    size_t size,
+    uint8_t mod,
+    uint8_t rm_field,
+    uint8_t rex,
+    size_t *offset,
+    xair_x86_operand *out_operand) {
+    if (mod == 3u) {
+        decode_set_reg(out_operand, decode_reg(rm_field, (uint8_t)(rex & 1u)));
+        return XAIR_OK;
+    }
+    return decode_memory_operand(bytes, size, mod, rm_field, rex, offset, out_operand);
+}
+
+static xair_status decode_modrm_move_or_lea(
     const uint8_t *bytes,
     size_t size,
     uint8_t opcode,
@@ -94,9 +247,7 @@ static xair_status decode_modrm_move(
     uint8_t mod;
     uint8_t reg_field;
     uint8_t rm_field;
-    xair_x86_reg reg;
-    xair_x86_reg rm;
-    uint32_t disp;
+    xair_x86_operand rm_operand;
 
     if ((rex & 8u) == 0) {
         return decode_unsupported(inst, opcode, 0);
@@ -106,108 +257,190 @@ static xair_status decode_modrm_move(
     }
     ++offset;
     decode_modrm(modrm, &mod, &reg_field, &rm_field);
-    reg = decode_reg(reg_field, (uint8_t)(rex & 4u));
-    rm = decode_reg(rm_field, (uint8_t)(rex & 1u));
 
-    inst->mnemonic = XAIR_X86_MNEMONIC_MOV;
-    inst->operand_count = 2;
-    if (mod == 3u) {
-        if (opcode == 0x8bu) {
-            decode_set_reg(&inst->operands[0], reg);
-            decode_set_reg(&inst->operands[1], rm);
-        } else {
-            decode_set_reg(&inst->operands[0], rm);
-            decode_set_reg(&inst->operands[1], reg);
+    if (opcode == 0x8du) {
+        if (mod == 3u) {
+            return decode_unsupported(inst, opcode, 0);
         }
+        if (decode_memory_operand(bytes, size, mod, rm_field, rex, &offset, &rm_operand) != XAIR_OK) {
+            return XAIR_ERR_RANGE;
+        }
+        inst->mnemonic = XAIR_X86_MNEMONIC_LEA;
+        inst->operand_count = 2;
+        decode_set_reg(&inst->operands[0], decode_reg(reg_field, (uint8_t)(rex & 4u)));
+        inst->operands[1] = rm_operand;
         inst->length = (uint8_t)offset;
         return XAIR_OK;
     }
-    if (mod == 0u && rm_field == 5u && (rex & 1u) == 0) {
-        if (!decode_read_le32(bytes, size, offset, &disp)) {
+
+    if (decode_rm_operand(bytes, size, mod, rm_field, rex, &offset, &rm_operand) != XAIR_OK) {
+        return XAIR_ERR_RANGE;
+    }
+    inst->mnemonic = XAIR_X86_MNEMONIC_MOV;
+    inst->operand_count = 2;
+    if (opcode == 0x8bu) {
+        decode_set_reg(&inst->operands[0], decode_reg(reg_field, (uint8_t)(rex & 4u)));
+        inst->operands[1] = rm_operand;
+    } else {
+        inst->operands[0] = rm_operand;
+        decode_set_reg(&inst->operands[1], decode_reg(reg_field, (uint8_t)(rex & 4u)));
+    }
+    inst->length = (uint8_t)offset;
+    return XAIR_OK;
+}
+
+static xair_x86_mnemonic decode_binary_mnemonic(uint8_t opcode) {
+    switch (opcode) {
+    case 0x01u:
+    case 0x03u:
+        return XAIR_X86_MNEMONIC_ADD;
+    case 0x09u:
+    case 0x0bu:
+        return XAIR_X86_MNEMONIC_OR;
+    case 0x21u:
+    case 0x23u:
+        return XAIR_X86_MNEMONIC_AND;
+    case 0x29u:
+    case 0x2bu:
+        return XAIR_X86_MNEMONIC_SUB;
+    case 0x31u:
+    case 0x33u:
+        return XAIR_X86_MNEMONIC_XOR;
+    case 0x39u:
+    case 0x3bu:
+        return XAIR_X86_MNEMONIC_CMP;
+    case 0x85u:
+        return XAIR_X86_MNEMONIC_TEST;
+    default:
+        return XAIR_X86_MNEMONIC_INVALID;
+    }
+}
+
+static int decode_reg_dest_opcode(uint8_t opcode) {
+    switch (opcode) {
+    case 0x03u:
+    case 0x0bu:
+    case 0x23u:
+    case 0x2bu:
+    case 0x33u:
+    case 0x3bu:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static xair_status decode_modrm_binary(
+    const uint8_t *bytes,
+    size_t size,
+    uint8_t opcode,
+    uint8_t rex,
+    size_t offset,
+    xair_x86_decoded_inst *inst) {
+    uint8_t modrm;
+    uint8_t mod;
+    uint8_t reg_field;
+    uint8_t rm_field;
+    xair_x86_operand rm_operand;
+    xair_x86_operand reg_operand;
+
+    if ((rex & 8u) == 0) {
+        return decode_unsupported(inst, opcode, 0);
+    }
+    if (!decode_read_u8(bytes, size, offset, &modrm)) {
+        return XAIR_ERR_RANGE;
+    }
+    ++offset;
+    decode_modrm(modrm, &mod, &reg_field, &rm_field);
+    if (decode_rm_operand(bytes, size, mod, rm_field, rex, &offset, &rm_operand) != XAIR_OK) {
+        return XAIR_ERR_RANGE;
+    }
+    if (rm_operand.kind != XAIR_X86_OPERAND_REGISTER) {
+        return decode_unsupported(inst, opcode, 0);
+    }
+    decode_set_reg(&reg_operand, decode_reg(reg_field, (uint8_t)(rex & 4u)));
+
+    inst->mnemonic = decode_binary_mnemonic(opcode);
+    if (inst->mnemonic == XAIR_X86_MNEMONIC_INVALID) {
+        return decode_unsupported(inst, opcode, 0);
+    }
+    inst->operand_count = 2;
+    if (decode_reg_dest_opcode(opcode)) {
+        inst->operands[0] = reg_operand;
+        inst->operands[1] = rm_operand;
+    } else {
+        inst->operands[0] = rm_operand;
+        inst->operands[1] = reg_operand;
+    }
+    inst->length = (uint8_t)offset;
+    return XAIR_OK;
+}
+
+static xair_x86_mnemonic decode_group1_mnemonic(uint8_t group) {
+    switch (group) {
+    case 0u: return XAIR_X86_MNEMONIC_ADD;
+    case 1u: return XAIR_X86_MNEMONIC_OR;
+    case 4u: return XAIR_X86_MNEMONIC_AND;
+    case 5u: return XAIR_X86_MNEMONIC_SUB;
+    case 6u: return XAIR_X86_MNEMONIC_XOR;
+    case 7u: return XAIR_X86_MNEMONIC_CMP;
+    default: return XAIR_X86_MNEMONIC_INVALID;
+    }
+}
+
+static xair_status decode_group1_imm(
+    const uint8_t *bytes,
+    size_t size,
+    uint8_t opcode,
+    uint8_t rex,
+    size_t offset,
+    xair_x86_decoded_inst *inst) {
+    uint8_t modrm;
+    uint8_t mod;
+    uint8_t group;
+    uint8_t rm_field;
+    xair_x86_operand rm_operand;
+    int64_t imm;
+
+    if ((rex & 8u) == 0) {
+        return decode_unsupported(inst, opcode, 0);
+    }
+    if (!decode_read_u8(bytes, size, offset, &modrm)) {
+        return XAIR_ERR_RANGE;
+    }
+    ++offset;
+    decode_modrm(modrm, &mod, &group, &rm_field);
+    if (decode_rm_operand(bytes, size, mod, rm_field, rex, &offset, &rm_operand) != XAIR_OK) {
+        return XAIR_ERR_RANGE;
+    }
+    if (rm_operand.kind != XAIR_X86_OPERAND_REGISTER) {
+        return decode_unsupported(inst, opcode, 0);
+    }
+    if (opcode == 0x83u) {
+        uint8_t raw_imm;
+
+        if (!decode_read_u8(bytes, size, offset, &raw_imm)) {
+            return XAIR_ERR_RANGE;
+        }
+        ++offset;
+        imm = decode_sign_extend8(raw_imm);
+    } else {
+        uint32_t raw_imm;
+
+        if (!decode_read_le32(bytes, size, offset, &raw_imm)) {
             return XAIR_ERR_RANGE;
         }
         offset += 4u;
-        if (opcode == 0x8bu) {
-            decode_set_reg(&inst->operands[0], reg);
-            decode_set_rip_mem(&inst->operands[1], decode_sign_extend32(disp));
-        } else {
-            decode_set_rip_mem(&inst->operands[0], decode_sign_extend32(disp));
-            decode_set_reg(&inst->operands[1], reg);
-        }
-        inst->length = (uint8_t)offset;
-        return XAIR_OK;
+        imm = decode_sign_extend32(raw_imm);
     }
-    return decode_unsupported(inst, opcode, 0);
-}
 
-static xair_status decode_modrm_alu(
-    const uint8_t *bytes,
-    size_t size,
-    uint8_t opcode,
-    uint8_t rex,
-    size_t offset,
-    xair_x86_decoded_inst *inst) {
-    uint8_t modrm;
-    uint8_t mod;
-    uint8_t reg_field;
-    uint8_t rm_field;
-    xair_x86_reg reg;
-    xair_x86_reg rm;
-
-    if ((rex & 8u) == 0) {
+    inst->mnemonic = decode_group1_mnemonic(group);
+    if (inst->mnemonic == XAIR_X86_MNEMONIC_INVALID) {
         return decode_unsupported(inst, opcode, 0);
     }
-    if (!decode_read_u8(bytes, size, offset, &modrm)) {
-        return XAIR_ERR_RANGE;
-    }
-    ++offset;
-    decode_modrm(modrm, &mod, &reg_field, &rm_field);
-    if (mod != 3u) {
-        return decode_unsupported(inst, opcode, 0);
-    }
-    reg = decode_reg(reg_field, (uint8_t)(rex & 4u));
-    rm = decode_reg(rm_field, (uint8_t)(rex & 1u));
-
     inst->operand_count = 2;
-    switch (opcode) {
-    case 0x01u:
-        inst->mnemonic = XAIR_X86_MNEMONIC_ADD;
-        decode_set_reg(&inst->operands[0], rm);
-        decode_set_reg(&inst->operands[1], reg);
-        break;
-    case 0x03u:
-        inst->mnemonic = XAIR_X86_MNEMONIC_ADD;
-        decode_set_reg(&inst->operands[0], reg);
-        decode_set_reg(&inst->operands[1], rm);
-        break;
-    case 0x29u:
-        inst->mnemonic = XAIR_X86_MNEMONIC_SUB;
-        decode_set_reg(&inst->operands[0], rm);
-        decode_set_reg(&inst->operands[1], reg);
-        break;
-    case 0x2bu:
-        inst->mnemonic = XAIR_X86_MNEMONIC_SUB;
-        decode_set_reg(&inst->operands[0], reg);
-        decode_set_reg(&inst->operands[1], rm);
-        break;
-    case 0x39u:
-        inst->mnemonic = XAIR_X86_MNEMONIC_CMP;
-        decode_set_reg(&inst->operands[0], rm);
-        decode_set_reg(&inst->operands[1], reg);
-        break;
-    case 0x3bu:
-        inst->mnemonic = XAIR_X86_MNEMONIC_CMP;
-        decode_set_reg(&inst->operands[0], reg);
-        decode_set_reg(&inst->operands[1], rm);
-        break;
-    case 0x85u:
-        inst->mnemonic = XAIR_X86_MNEMONIC_TEST;
-        decode_set_reg(&inst->operands[0], rm);
-        decode_set_reg(&inst->operands[1], reg);
-        break;
-    default:
-        return decode_unsupported(inst, opcode, 0);
-    }
+    inst->operands[0] = rm_operand;
+    decode_set_imm(&inst->operands[1], opcode == 0x83u ? 8 : 32, imm);
     inst->length = (uint8_t)offset;
     return XAIR_OK;
 }
@@ -260,20 +493,45 @@ xair_status xair_x86_decode64(
         return XAIR_OK;
     }
 
+    if ((opcode >= 0x50u && opcode <= 0x57u) || (opcode >= 0x58u && opcode <= 0x5fu)) {
+        inst.mnemonic = opcode < 0x58u ? XAIR_X86_MNEMONIC_PUSH : XAIR_X86_MNEMONIC_POP;
+        inst.operand_count = 1;
+        inst.length = (uint8_t)offset;
+        decode_set_reg(&inst.operands[0], decode_reg((uint8_t)(opcode & 7u), (uint8_t)(rex & 1u)));
+        *out_inst = inst;
+        return XAIR_OK;
+    }
+
     switch (opcode) {
+    case 0x90u:
+        inst.mnemonic = XAIR_X86_MNEMONIC_NOP;
+        inst.length = (uint8_t)offset;
+        *out_inst = inst;
+        return XAIR_OK;
     case 0x8bu:
     case 0x89u:
+    case 0x8du:
         *out_inst = inst;
-        return decode_modrm_move(bytes, size, opcode, rex, offset, out_inst);
+        return decode_modrm_move_or_lea(bytes, size, opcode, rex, offset, out_inst);
     case 0x01u:
     case 0x03u:
+    case 0x09u:
+    case 0x0bu:
+    case 0x21u:
+    case 0x23u:
     case 0x29u:
     case 0x2bu:
+    case 0x31u:
+    case 0x33u:
     case 0x39u:
     case 0x3bu:
     case 0x85u:
         *out_inst = inst;
-        return decode_modrm_alu(bytes, size, opcode, rex, offset, out_inst);
+        return decode_modrm_binary(bytes, size, opcode, rex, offset, out_inst);
+    case 0x81u:
+    case 0x83u:
+        *out_inst = inst;
+        return decode_group1_imm(bytes, size, opcode, rex, offset, out_inst);
     case 0xebu: {
         uint8_t rel;
 

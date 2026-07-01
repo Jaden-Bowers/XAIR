@@ -36,6 +36,7 @@ static void lift_result_init(xair_lift_result *result) {
     result->memory_out = XAIR_INVALID_ID;
     result->branch_condition = XAIR_INVALID_ID;
     for (i = 0; i < XAIR_LIFT_MAX_REG_OUTPUTS; ++i) {
+        result->input_regs[i].value = XAIR_INVALID_ID;
         result->output_regs[i].value = XAIR_INVALID_ID;
     }
     for (i = 0; i < XAIR_LIFT_MAX_RETURNS; ++i) {
@@ -126,6 +127,12 @@ static xair_status x86_ensure_reg(
     if (status != XAIR_OK) {
         return status;
     }
+    if (state->result->input_reg_count >= XAIR_LIFT_MAX_REG_OUTPUTS) {
+        return XAIR_ERR_RANGE;
+    }
+    state->result->input_regs[state->result->input_reg_count].reg = reg;
+    state->result->input_regs[state->result->input_reg_count].value = state->regs[reg];
+    ++state->result->input_reg_count;
     *out_value = state->regs[reg];
     return XAIR_OK;
 }
@@ -187,26 +194,52 @@ static xair_status x86_set_zf_from_flags(x86_lift_state *state, xair_value_id fl
     return XAIR_OK;
 }
 
-static xair_status x86_lift_add_sub(
+static xair_status x86_set_zf_from_value(x86_lift_state *state, xair_value_id value) {
+    xair_value_id zero;
+    xair_status status;
+
+    status = x86_build_const_u64(state, xair_type_i(64), 0, "zero", &zero);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    status = xair_build_binary(
+        state->module,
+        state->block,
+        XAIR_OP_EQ,
+        xair_type_i(1),
+        value,
+        zero,
+        "zf",
+        &state->zf);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    state->has_zf = 1;
+    return XAIR_OK;
+}
+
+static xair_status x86_const_i64(x86_lift_state *state, int64_t value, const char *name, xair_value_id *out_value) {
+    return x86_build_const_u64(state, xair_type_i(64), (uint64_t)value, name, out_value);
+}
+
+static uint64_t x86_add_i64(uint64_t base, int64_t offset) {
+    if (offset < 0) {
+        return base - (uint64_t)(-offset);
+    }
+    return base + (uint64_t)offset;
+}
+
+static xair_status x86_lift_add_sub_values(
     x86_lift_state *state,
     xair_opcode value_opcode,
     xair_opcode flags_opcode,
     xair_x86_reg dst,
-    xair_x86_reg src) {
-    xair_value_id lhs;
-    xair_value_id rhs;
+    xair_value_id lhs,
+    xair_value_id rhs) {
     xair_value_id value;
     xair_value_id flags;
     xair_status status;
 
-    status = x86_ensure_reg(state, dst, &lhs);
-    if (status != XAIR_OK) {
-        return status;
-    }
-    status = x86_ensure_reg(state, src, &rhs);
-    if (status != XAIR_OK) {
-        return status;
-    }
     status = xair_build_binary(
         state->module,
         state->block,
@@ -239,20 +272,10 @@ static xair_status x86_lift_add_sub(
     return XAIR_OK;
 }
 
-static xair_status x86_lift_cmp(x86_lift_state *state, xair_x86_reg lhs_reg, xair_x86_reg rhs_reg) {
-    xair_value_id lhs;
-    xair_value_id rhs;
+static xair_status x86_lift_cmp_values(x86_lift_state *state, xair_value_id lhs, xair_value_id rhs) {
     xair_value_id flags;
     xair_status status;
 
-    status = x86_ensure_reg(state, lhs_reg, &lhs);
-    if (status != XAIR_OK) {
-        return status;
-    }
-    status = x86_ensure_reg(state, rhs_reg, &rhs);
-    if (status != XAIR_OK) {
-        return status;
-    }
     status = xair_build_binary(
         state->module,
         state->block,
@@ -268,21 +291,10 @@ static xair_status x86_lift_cmp(x86_lift_state *state, xair_x86_reg lhs_reg, xai
     return x86_set_zf_from_flags(state, flags);
 }
 
-static xair_status x86_lift_test(x86_lift_state *state, xair_x86_reg lhs_reg, xair_x86_reg rhs_reg) {
-    xair_value_id lhs;
-    xair_value_id rhs;
+static xair_status x86_lift_test_values(x86_lift_state *state, xair_value_id lhs, xair_value_id rhs) {
     xair_value_id and_value;
-    xair_value_id zero;
     xair_status status;
 
-    status = x86_ensure_reg(state, lhs_reg, &lhs);
-    if (status != XAIR_OK) {
-        return status;
-    }
-    status = x86_ensure_reg(state, rhs_reg, &rhs);
-    if (status != XAIR_OK) {
-        return status;
-    }
     status = xair_build_binary(
         state->module,
         state->block,
@@ -295,30 +307,188 @@ static xair_status x86_lift_test(x86_lift_state *state, xair_x86_reg lhs_reg, xa
     if (status != XAIR_OK) {
         return status;
     }
-    status = x86_build_const_u64(state, xair_type_i(64), 0, "zero", &zero);
-    if (status != XAIR_OK) {
-        return status;
-    }
+    return x86_set_zf_from_value(state, and_value);
+}
+
+static xair_status x86_lift_logic_values(
+    x86_lift_state *state,
+    xair_opcode opcode,
+    xair_x86_reg dst,
+    xair_value_id lhs,
+    xair_value_id rhs) {
+    xair_value_id value;
+    xair_status status;
+
     status = xair_build_binary(
         state->module,
         state->block,
-        XAIR_OP_EQ,
-        xair_type_i(1),
-        and_value,
-        zero,
-        "zf",
-        &state->zf);
+        opcode,
+        xair_type_i(64),
+        lhs,
+        rhs,
+        xair_opcode_name(opcode),
+        &value);
     if (status != XAIR_OK) {
         return status;
     }
-    state->has_zf = 1;
+    status = x86_set_zf_from_value(state, value);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    x86_write_reg(state, dst, value);
     return XAIR_OK;
 }
 
-static xair_status x86_lift_rip_load(
+static xair_status x86_int_to_addr(x86_lift_state *state, xair_value_id value, xair_value_id *out_addr) {
+    return xair_build_unary(
+        state->module,
+        state->block,
+        XAIR_OP_INT_TO_ADDR,
+        xair_type_addr(64),
+        value,
+        "addr",
+        out_addr);
+}
+
+static xair_status x86_addr_to_int(x86_lift_state *state, xair_value_id value, xair_value_id *out_int) {
+    return xair_build_unary(
+        state->module,
+        state->block,
+        XAIR_OP_ADDR_TO_INT,
+        xair_type_i(64),
+        value,
+        "lea",
+        out_int);
+}
+
+static xair_status x86_addr_add_i64(
+    x86_lift_state *state,
+    xair_value_id base,
+    int64_t offset,
+    const char *name,
+    xair_value_id *out_addr) {
+    xair_value_id delta;
+    xair_status status;
+
+    status = x86_const_i64(state, offset, "disp", &delta);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    return xair_build_binary(
+        state->module,
+        state->block,
+        XAIR_OP_ADDR_ADD,
+        xair_type_addr(64),
+        base,
+        delta,
+        name,
+        out_addr);
+}
+
+static xair_status x86_build_memory_address(
+    x86_lift_state *state,
+    const xair_x86_memory_operand *mem,
+    uint64_t next_pc,
+    xair_value_id *out_addr) {
+    xair_value_id addr = XAIR_INVALID_ID;
+    xair_status status;
+
+    if (state == NULL || mem == NULL || out_addr == NULL) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    if (mem->kind == XAIR_X86_MEM_RIP_REL) {
+        return x86_build_const_u64(
+            state,
+            xair_type_addr(64),
+            x86_add_i64(next_pc, mem->displacement),
+            "rip_addr",
+            out_addr);
+    }
+    if (mem->kind != XAIR_X86_MEM_BASE_INDEX) {
+        return XAIR_ERR_UNSUPPORTED;
+    }
+    if (mem->has_base) {
+        xair_value_id base_value;
+
+        status = x86_ensure_reg(state, mem->base, &base_value);
+        if (status != XAIR_OK) {
+            return status;
+        }
+        status = x86_int_to_addr(state, base_value, &addr);
+        if (status != XAIR_OK) {
+            return status;
+        }
+    }
+    if (mem->has_index) {
+        xair_value_id index_value;
+        xair_value_id scaled_value = XAIR_INVALID_ID;
+
+        status = x86_ensure_reg(state, mem->index, &index_value);
+        if (status != XAIR_OK) {
+            return status;
+        }
+        if (mem->scale != 1u) {
+            xair_value_id scale_value;
+
+            status = x86_const_i64(state, (int64_t)mem->scale, "scale", &scale_value);
+            if (status != XAIR_OK) {
+                return status;
+            }
+            status = xair_build_binary(
+                state->module,
+                state->block,
+                XAIR_OP_MUL,
+                xair_type_i(64),
+                index_value,
+                scale_value,
+                "index",
+                &scaled_value);
+            if (status != XAIR_OK) {
+                return status;
+            }
+        } else {
+            scaled_value = index_value;
+        }
+        if (addr == XAIR_INVALID_ID) {
+            status = x86_int_to_addr(state, scaled_value, &addr);
+            if (status != XAIR_OK) {
+                return status;
+            }
+        } else {
+            status = xair_build_binary(
+                state->module,
+                state->block,
+                XAIR_OP_ADDR_ADD,
+                xair_type_addr(64),
+                addr,
+                scaled_value,
+                "addr_index",
+                &addr);
+            if (status != XAIR_OK) {
+                return status;
+            }
+        }
+    }
+    if (addr == XAIR_INVALID_ID) {
+        return x86_build_const_u64(
+            state,
+            xair_type_addr(64),
+            (uint64_t)mem->displacement,
+            "addr",
+            out_addr);
+    }
+    if (mem->displacement != 0) {
+        return x86_addr_add_i64(state, addr, mem->displacement, "addr_disp", out_addr);
+    }
+    *out_addr = addr;
+    return XAIR_OK;
+}
+
+static xair_status x86_lift_mem_load(
     x86_lift_state *state,
     xair_x86_reg dst,
-    uint64_t address) {
+    const xair_x86_memory_operand *mem,
+    uint64_t next_pc) {
     xair_value_id memory;
     xair_value_id addr_value;
     xair_value_id loaded;
@@ -328,7 +498,7 @@ static xair_status x86_lift_rip_load(
     if (status != XAIR_OK) {
         return status;
     }
-    status = x86_build_const_u64(state, xair_type_addr(64), address, "addr", &addr_value);
+    status = x86_build_memory_address(state, mem, next_pc, &addr_value);
     if (status != XAIR_OK) {
         return status;
     }
@@ -348,13 +518,13 @@ static xair_status x86_lift_rip_load(
     return XAIR_OK;
 }
 
-static xair_status x86_lift_rip_store(
+static xair_status x86_lift_mem_store(
     x86_lift_state *state,
-    xair_x86_reg src,
-    uint64_t address) {
+    const xair_x86_memory_operand *mem,
+    xair_value_id data,
+    uint64_t next_pc) {
     xair_value_id memory;
     xair_value_id addr_value;
-    xair_value_id data;
     xair_value_id next_memory;
     xair_status status;
 
@@ -362,11 +532,7 @@ static xair_status x86_lift_rip_store(
     if (status != XAIR_OK) {
         return status;
     }
-    status = x86_ensure_reg(state, src, &data);
-    if (status != XAIR_OK) {
-        return status;
-    }
-    status = x86_build_const_u64(state, xair_type_addr(64), address, "addr", &addr_value);
+    status = x86_build_memory_address(state, mem, next_pc, &addr_value);
     if (status != XAIR_OK) {
         return status;
     }
@@ -529,24 +695,33 @@ static int x86_get_imm_operand(
     return 1;
 }
 
-static int x86_get_rip_mem_operand(
+static int x86_get_mem_operand(
     const xair_x86_decoded_inst *inst,
     size_t index,
-    int64_t *out_displacement) {
-    if (inst == NULL || out_displacement == NULL || index >= inst->operand_count ||
-        inst->operands[index].kind != XAIR_X86_OPERAND_MEMORY ||
-        inst->operands[index].value.mem.kind != XAIR_X86_MEM_RIP_REL) {
+    const xair_x86_memory_operand **out_mem) {
+    if (inst == NULL || out_mem == NULL || index >= inst->operand_count ||
+        inst->operands[index].kind != XAIR_X86_OPERAND_MEMORY) {
         return 0;
     }
-    *out_displacement = inst->operands[index].value.mem.displacement;
+    *out_mem = &inst->operands[index].value.mem;
     return 1;
 }
 
-static uint64_t x86_add_i64(uint64_t base, int64_t offset) {
-    if (offset < 0) {
-        return base - (uint64_t)(-offset);
+static xair_status x86_operand_value(
+    x86_lift_state *state,
+    const xair_x86_decoded_inst *inst,
+    size_t index,
+    xair_value_id *out_value) {
+    xair_x86_reg reg;
+    int64_t imm;
+
+    if (x86_get_reg_operand(inst, index, &reg)) {
+        return x86_ensure_reg(state, reg, out_value);
     }
-    return base + (uint64_t)offset;
+    if (x86_get_imm_operand(inst, index, &imm)) {
+        return x86_const_i64(state, imm, "imm", out_value);
+    }
+    return XAIR_ERR_UNSUPPORTED;
 }
 
 static xair_status x86_lift_mov_decoded(
@@ -556,7 +731,7 @@ static xair_status x86_lift_mov_decoded(
     xair_x86_reg dst;
     xair_x86_reg src;
     int64_t imm;
-    int64_t displacement;
+    const xair_x86_memory_operand *mem;
     xair_status status;
 
     if (x86_get_reg_operand(inst, 0, &dst) && x86_get_imm_operand(inst, 1, &imm)) {
@@ -579,34 +754,201 @@ static xair_status x86_lift_mov_decoded(
         x86_write_reg(state, dst, value);
         return XAIR_OK;
     }
-    if (x86_get_reg_operand(inst, 0, &dst) && x86_get_rip_mem_operand(inst, 1, &displacement)) {
-        return x86_lift_rip_load(state, dst, x86_add_i64(next_pc, displacement));
+    if (x86_get_reg_operand(inst, 0, &dst) && x86_get_mem_operand(inst, 1, &mem)) {
+        return x86_lift_mem_load(state, dst, mem, next_pc);
     }
-    if (x86_get_rip_mem_operand(inst, 0, &displacement) && x86_get_reg_operand(inst, 1, &src)) {
-        return x86_lift_rip_store(state, src, x86_add_i64(next_pc, displacement));
+    if (x86_get_mem_operand(inst, 0, &mem) && x86_get_reg_operand(inst, 1, &src)) {
+        xair_value_id data;
+
+        status = x86_ensure_reg(state, src, &data);
+        if (status != XAIR_OK) {
+            return status;
+        }
+        return x86_lift_mem_store(state, mem, data, next_pc);
     }
     return XAIR_ERR_UNSUPPORTED;
 }
 
+static xair_status x86_lift_lea_decoded(
+    x86_lift_state *state,
+    const xair_x86_decoded_inst *inst,
+    uint64_t next_pc) {
+    xair_x86_reg dst;
+    const xair_x86_memory_operand *mem;
+    xair_value_id addr;
+    xair_value_id value;
+    xair_status status;
+
+    if (!x86_get_reg_operand(inst, 0, &dst) || !x86_get_mem_operand(inst, 1, &mem)) {
+        return XAIR_ERR_UNSUPPORTED;
+    }
+    status = x86_build_memory_address(state, mem, next_pc, &addr);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    status = x86_addr_to_int(state, addr, &value);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    x86_write_reg(state, dst, value);
+    return XAIR_OK;
+}
+
+static xair_opcode x86_logic_opcode(xair_x86_mnemonic mnemonic) {
+    switch (mnemonic) {
+    case XAIR_X86_MNEMONIC_AND:
+        return XAIR_OP_AND;
+    case XAIR_X86_MNEMONIC_OR:
+        return XAIR_OP_OR;
+    case XAIR_X86_MNEMONIC_XOR:
+        return XAIR_OP_XOR;
+    default:
+        return XAIR_OP_CONST_U64;
+    }
+}
+
 static xair_status x86_lift_alu_decoded(x86_lift_state *state, const xair_x86_decoded_inst *inst) {
     xair_x86_reg dst;
-    xair_x86_reg src;
+    xair_value_id lhs;
+    xair_value_id rhs;
+    xair_status status;
 
-    if (!x86_get_reg_operand(inst, 0, &dst) || !x86_get_reg_operand(inst, 1, &src)) {
+    if (!x86_get_reg_operand(inst, 0, &dst)) {
+        return XAIR_ERR_UNSUPPORTED;
+    }
+    status = x86_ensure_reg(state, dst, &lhs);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    status = x86_operand_value(state, inst, 1, &rhs);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    if (inst->operands[1].kind == XAIR_X86_OPERAND_MEMORY) {
         return XAIR_ERR_UNSUPPORTED;
     }
     switch (inst->mnemonic) {
     case XAIR_X86_MNEMONIC_ADD:
-        return x86_lift_add_sub(state, XAIR_OP_ADD, XAIR_OP_FLAGS_ADD, dst, src);
+        return x86_lift_add_sub_values(state, XAIR_OP_ADD, XAIR_OP_FLAGS_ADD, dst, lhs, rhs);
     case XAIR_X86_MNEMONIC_SUB:
-        return x86_lift_add_sub(state, XAIR_OP_SUB, XAIR_OP_FLAGS_SUB, dst, src);
+        return x86_lift_add_sub_values(state, XAIR_OP_SUB, XAIR_OP_FLAGS_SUB, dst, lhs, rhs);
+    case XAIR_X86_MNEMONIC_AND:
+    case XAIR_X86_MNEMONIC_OR:
+    case XAIR_X86_MNEMONIC_XOR:
+        return x86_lift_logic_values(state, x86_logic_opcode(inst->mnemonic), dst, lhs, rhs);
     case XAIR_X86_MNEMONIC_CMP:
-        return x86_lift_cmp(state, dst, src);
+        return x86_lift_cmp_values(state, lhs, rhs);
     case XAIR_X86_MNEMONIC_TEST:
-        return x86_lift_test(state, dst, src);
+        return x86_lift_test_values(state, lhs, rhs);
     default:
         return XAIR_ERR_UNSUPPORTED;
     }
+}
+
+static xair_status x86_lift_push_decoded(x86_lift_state *state, const xair_x86_decoded_inst *inst) {
+    xair_x86_reg src;
+    xair_value_id rsp;
+    xair_value_id data;
+    xair_value_id eight;
+    xair_value_id next_rsp;
+    xair_value_id addr;
+    xair_value_id memory;
+    xair_value_id next_memory;
+    xair_status status;
+
+    if (!x86_get_reg_operand(inst, 0, &src)) {
+        return XAIR_ERR_UNSUPPORTED;
+    }
+    status = x86_ensure_reg(state, XAIR_X86_RSP, &rsp);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    status = x86_ensure_reg(state, src, &data);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    status = x86_const_i64(state, 8, "push_size", &eight);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    status = xair_build_binary(state->module, state->block, XAIR_OP_SUB, xair_type_i(64), rsp, eight, "push_rsp", &next_rsp);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    status = x86_int_to_addr(state, next_rsp, &addr);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    status = x86_ensure_memory(state, &memory);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    status = xair_build_store(
+        state->module,
+        state->block,
+        memory,
+        addr,
+        data,
+        XAIR_ENDIAN_LE,
+        "push",
+        &next_memory);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    state->memory = next_memory;
+    state->result->memory_out = next_memory;
+    x86_write_reg(state, XAIR_X86_RSP, next_rsp);
+    return XAIR_OK;
+}
+
+static xair_status x86_lift_pop_decoded(x86_lift_state *state, const xair_x86_decoded_inst *inst) {
+    xair_x86_reg dst;
+    xair_value_id rsp;
+    xair_value_id addr;
+    xair_value_id memory;
+    xair_value_id loaded;
+    xair_value_id eight;
+    xair_value_id next_rsp;
+    xair_status status;
+
+    if (!x86_get_reg_operand(inst, 0, &dst)) {
+        return XAIR_ERR_UNSUPPORTED;
+    }
+    status = x86_ensure_reg(state, XAIR_X86_RSP, &rsp);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    status = x86_int_to_addr(state, rsp, &addr);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    status = x86_ensure_memory(state, &memory);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    status = xair_build_load(
+        state->module,
+        state->block,
+        xair_type_i(64),
+        memory,
+        addr,
+        XAIR_ENDIAN_LE,
+        "pop",
+        &loaded);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    status = x86_const_i64(state, 8, "pop_size", &eight);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    status = xair_build_binary(state->module, state->block, XAIR_OP_ADD, xair_type_i(64), rsp, eight, "pop_rsp", &next_rsp);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    x86_write_reg(state, dst, loaded);
+    x86_write_reg(state, XAIR_X86_RSP, next_rsp);
+    return XAIR_OK;
 }
 
 static xair_status x86_lift_one(x86_lift_state *state, int *out_done) {
@@ -630,14 +972,29 @@ static xair_status x86_lift_one(x86_lift_state *state, int *out_done) {
     next_pc = inst_start + inst.length;
 
     switch (inst.mnemonic) {
+    case XAIR_X86_MNEMONIC_NOP:
+        status = XAIR_OK;
+        break;
     case XAIR_X86_MNEMONIC_MOV:
         status = x86_lift_mov_decoded(state, &inst, next_pc);
         break;
+    case XAIR_X86_MNEMONIC_LEA:
+        status = x86_lift_lea_decoded(state, &inst, next_pc);
+        break;
     case XAIR_X86_MNEMONIC_ADD:
     case XAIR_X86_MNEMONIC_SUB:
+    case XAIR_X86_MNEMONIC_AND:
+    case XAIR_X86_MNEMONIC_OR:
+    case XAIR_X86_MNEMONIC_XOR:
     case XAIR_X86_MNEMONIC_CMP:
     case XAIR_X86_MNEMONIC_TEST:
         status = x86_lift_alu_decoded(state, &inst);
+        break;
+    case XAIR_X86_MNEMONIC_PUSH:
+        status = x86_lift_push_decoded(state, &inst);
+        break;
+    case XAIR_X86_MNEMONIC_POP:
+        status = x86_lift_pop_decoded(state, &inst);
         break;
     case XAIR_X86_MNEMONIC_JMP: {
         int64_t rel;

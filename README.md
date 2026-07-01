@@ -7,14 +7,14 @@ The design target is narrower than a compiler IR and more explicit than VEX:
 typed SSA values, byte-addressed memory, explicit memory versions, lazy flag
 summaries, and no opaque helper calls in optimized hot paths.
 
-Current status: Phase 5A binary-to-IR frontend prototype.
+Current status: Phase 5B benchmark-ready binary-to-IR frontend prototype.
 
 Implemented pieces:
 - Core XAIR module, verifier, formatter, and metrics.
 - Canonicalization pass.
 - Concrete C executor baseline.
 - VEX-shaped adapter layer.
-- Raw x86-64 basic-block lifter for a narrow instruction subset.
+- Raw x86-64 basic-block lifter for a benchmark-oriented instruction subset.
 - `xair_lift_raw` tool for lifting raw byte blobs into XAIR text.
 
 ## Build
@@ -35,8 +35,12 @@ This tool expects a raw byte blob, not a PE/ELF/Mach-O file. It prints lift
 metadata and the generated XAIR block. CFG construction is intentionally left
 for a later separate project that consumes this frontend.
 
+The frontend reports block input registers, output registers, memory tokens,
+branch metadata, and generated XAIR so lift speed and IR inflation can be
+benchmarked separately from CFG recovery.
+
 ## Attribution
 
 The private x86 decoder stub is shaped after Zydis' decoded-instruction and
 typed-operand API style, but does not vendor Zydis source code or generated
-tables. Zydis is MIT licensed by Florian Bernd, Joel Höner, and contributors.
+tables. Zydis is MIT licensed by Florian Bernd, Joel Hoener, and contributors.
