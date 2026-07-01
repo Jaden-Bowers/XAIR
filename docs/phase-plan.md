@@ -67,6 +67,23 @@ Exit criterion:
 
 Goal: outperform VEX on the first native architecture.
 
+### Phase 5A: Binary-To-IR Frontend Boundary
+
+Goal: make the IR generator independently usable before CFG recovery exists.
+
+Scope:
+- Raw byte image abstraction.
+- x86-64 basic-block lift API.
+- Standalone raw lifting executable.
+- Exit metadata for return, direct jump, direct conditional branch, fallthrough,
+  and unsupported instruction.
+
+Exit criterion:
+- A raw byte blob can be lifted into verifier-valid XAIR.
+- Lifting can be benchmarked separately from CFG construction.
+
+### Phase 5B: Full Native x86-64 Lifter
+
 Scope:
 - Zydis decoder.
 - REX, ModR/M, SIB, RIP-relative addressing.
@@ -90,4 +107,3 @@ Scope:
 Exit criterion:
 - Taint propagation and symbolic query counts are measured separately.
 - Symbolic pointer tests avoid uncontrolled address forking on common cases.
-
