@@ -1038,6 +1038,631 @@ xair_status xair_verify_module(const xair_module *module, xair_error *error) {
     return XAIR_OK;
 }
 
+xair_status xair_get_module_metrics(const xair_module *module, xair_module_metrics *out_metrics) {
+    size_t i;
+
+    if (module == NULL || out_metrics == NULL) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    memset(out_metrics, 0, sizeof(*out_metrics));
+    out_metrics->blocks = module->block_count;
+    out_metrics->values = module->value_count;
+    out_metrics->operations = module->op_count;
+
+    for (i = 0; i < module->block_count; ++i) {
+        const xair_block_rec *block = &module->blocks[i];
+        out_metrics->block_parameters += block->param_count;
+        switch (block->term.kind) {
+        case XAIR_TERM_JUMP:
+        case XAIR_TERM_RETURN:
+            out_metrics->terminator_arguments += block->term.true_arg_count;
+            break;
+        case XAIR_TERM_CBRANCH:
+            out_metrics->terminator_arguments += block->term.true_arg_count + block->term.false_arg_count + 1;
+            break;
+        default:
+            break;
+        }
+    }
+    return XAIR_OK;
+}
+
+xair_status xair_ops_per_instruction(
+    const xair_module *module,
+    size_t machine_instruction_count,
+    double *out_ratio) {
+    if (module == NULL || out_ratio == NULL || machine_instruction_count == 0) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    *out_ratio = (double)module->op_count / (double)machine_instruction_count;
+    return XAIR_OK;
+}
+
+static uint64_t mask_for_bits(uint16_t bits) {
+    if (bits >= 64) {
+        return UINT64_MAX;
+    }
+    return (UINT64_C(1) << bits) - UINT64_C(1);
+}
+
+static uint64_t sign_bit_for_bits(uint16_t bits) {
+    return bits == 64 ? (UINT64_C(1) << 63) : (UINT64_C(1) << (bits - 1));
+}
+
+static uint64_t truncate_to_type(uint64_t value, xair_type type) {
+    if (type.kind != XAIR_TYPE_INT && type.kind != XAIR_TYPE_ADDR) {
+        return value;
+    }
+    return value & mask_for_bits(type.bits);
+}
+
+static int const_u64_value(const xair_module *module, xair_value_id value, uint64_t *out_value) {
+    xair_op_id op_id;
+    const xair_op_rec *op;
+    xair_type type;
+
+    if (!valid_value(module, value)) {
+        return 0;
+    }
+    type = module->values[value].type;
+    if ((type.kind != XAIR_TYPE_INT && type.kind != XAIR_TYPE_ADDR) || type.bits > 64) {
+        return 0;
+    }
+    op_id = module->values[value].op;
+    if (op_id == XAIR_INVALID_ID || op_id >= module->op_count) {
+        return 0;
+    }
+    op = &module->ops[op_id];
+    if (op->opcode != XAIR_OP_CONST_U64) {
+        return 0;
+    }
+    *out_value = truncate_to_type(op->imm, type);
+    return 1;
+}
+
+static int signed_less_u64(uint64_t lhs, uint64_t rhs, uint16_t bits) {
+    uint64_t sign = sign_bit_for_bits(bits);
+    uint64_t mask = mask_for_bits(bits);
+    int lhs_negative;
+    int rhs_negative;
+
+    lhs &= mask;
+    rhs &= mask;
+    lhs_negative = (lhs & sign) != 0;
+    rhs_negative = (rhs & sign) != 0;
+    if (lhs_negative != rhs_negative) {
+        return lhs_negative;
+    }
+    return lhs < rhs;
+}
+
+static void fold_to_const(xair_op_rec *op, uint64_t value, xair_type type) {
+    op->opcode = XAIR_OP_CONST_U64;
+    op->src_count = 0;
+    op->src[0] = XAIR_INVALID_ID;
+    op->src[1] = XAIR_INVALID_ID;
+    op->src[2] = XAIR_INVALID_ID;
+    op->endian = XAIR_ENDIAN_LE;
+    op->imm = truncate_to_type(value, type);
+}
+
+static int compute_flag_extract(
+    const xair_module *module,
+    xair_opcode extract_opcode,
+    xair_value_id flags_value,
+    uint64_t *out_value) {
+    xair_op_id flags_op_id;
+    const xair_op_rec *flags_op;
+    xair_type operand_type;
+    uint16_t bits;
+    uint64_t lhs;
+    uint64_t rhs;
+    uint64_t result;
+    uint64_t mask;
+    uint64_t sign;
+    int lhs_sign;
+    int rhs_sign;
+    int result_sign;
+
+    if (!valid_value(module, flags_value)) {
+        return 0;
+    }
+    flags_op_id = module->values[flags_value].op;
+    if (flags_op_id == XAIR_INVALID_ID || flags_op_id >= module->op_count) {
+        return 0;
+    }
+    flags_op = &module->ops[flags_op_id];
+    if (flags_op->opcode != XAIR_OP_FLAGS_ADD && flags_op->opcode != XAIR_OP_FLAGS_SUB) {
+        return 0;
+    }
+    if (!const_u64_value(module, flags_op->src[0], &lhs) || !const_u64_value(module, flags_op->src[1], &rhs)) {
+        return 0;
+    }
+
+    operand_type = module->values[flags_op->src[0]].type;
+    if (!is_int(operand_type) || operand_type.bits > 64) {
+        return 0;
+    }
+
+    bits = operand_type.bits;
+    mask = mask_for_bits(bits);
+    sign = sign_bit_for_bits(bits);
+    lhs &= mask;
+    rhs &= mask;
+    result = flags_op->opcode == XAIR_OP_FLAGS_ADD ? (lhs + rhs) & mask : (lhs - rhs) & mask;
+
+    lhs_sign = (lhs & sign) != 0;
+    rhs_sign = (rhs & sign) != 0;
+    result_sign = (result & sign) != 0;
+
+    switch (extract_opcode) {
+    case XAIR_OP_FLAG_ZF:
+        *out_value = result == 0;
+        return 1;
+    case XAIR_OP_FLAG_CF:
+        *out_value = flags_op->opcode == XAIR_OP_FLAGS_ADD ? result < lhs : lhs < rhs;
+        return 1;
+    case XAIR_OP_FLAG_OF:
+        if (flags_op->opcode == XAIR_OP_FLAGS_ADD) {
+            *out_value = (lhs_sign == rhs_sign) && (result_sign != lhs_sign);
+        } else {
+            *out_value = (lhs_sign != rhs_sign) && (result_sign != lhs_sign);
+        }
+        return 1;
+    case XAIR_OP_FLAG_SF:
+        *out_value = result_sign;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int fold_constant_op(xair_module *module, xair_op_rec *op) {
+    xair_type out;
+    xair_type lhs_type;
+    uint64_t lhs;
+    uint64_t rhs;
+    uint64_t folded;
+    uint64_t shift;
+
+    out = module->values[op->dst].type;
+    switch (op->opcode) {
+    case XAIR_OP_ADD:
+    case XAIR_OP_SUB:
+    case XAIR_OP_MUL:
+    case XAIR_OP_AND:
+    case XAIR_OP_OR:
+    case XAIR_OP_XOR:
+        if (!is_int(out) || out.bits > 64 ||
+            !const_u64_value(module, op->src[0], &lhs) ||
+            !const_u64_value(module, op->src[1], &rhs)) {
+            return 0;
+        }
+        switch (op->opcode) {
+        case XAIR_OP_ADD: folded = lhs + rhs; break;
+        case XAIR_OP_SUB: folded = lhs - rhs; break;
+        case XAIR_OP_MUL: folded = lhs * rhs; break;
+        case XAIR_OP_AND: folded = lhs & rhs; break;
+        case XAIR_OP_OR: folded = lhs | rhs; break;
+        default: folded = lhs ^ rhs; break;
+        }
+        fold_to_const(op, folded, out);
+        return 1;
+
+    case XAIR_OP_SHL:
+    case XAIR_OP_LSHR:
+    case XAIR_OP_ASHR:
+        if (!is_int(out) || out.bits > 64 ||
+            !const_u64_value(module, op->src[0], &lhs) ||
+            !const_u64_value(module, op->src[1], &rhs)) {
+            return 0;
+        }
+        shift = rhs;
+        if (shift >= out.bits) {
+            return 0;
+        }
+        lhs &= mask_for_bits(out.bits);
+        if (op->opcode == XAIR_OP_SHL) {
+            folded = lhs << shift;
+        } else if (op->opcode == XAIR_OP_LSHR) {
+            folded = lhs >> shift;
+        } else if (shift == 0) {
+            folded = lhs;
+        } else if ((lhs & sign_bit_for_bits(out.bits)) != 0) {
+            folded = (lhs >> shift) | (mask_for_bits(out.bits) << (out.bits - shift));
+        } else {
+            folded = lhs >> shift;
+        }
+        fold_to_const(op, folded, out);
+        return 1;
+
+    case XAIR_OP_EQ:
+    case XAIR_OP_NE:
+    case XAIR_OP_ULT:
+    case XAIR_OP_ULE:
+    case XAIR_OP_SLT:
+    case XAIR_OP_SLE:
+        if (!const_u64_value(module, op->src[0], &lhs) || !const_u64_value(module, op->src[1], &rhs)) {
+            return 0;
+        }
+        lhs_type = module->values[op->src[0]].type;
+        if (lhs_type.bits > 64) {
+            return 0;
+        }
+        lhs &= mask_for_bits(lhs_type.bits);
+        rhs &= mask_for_bits(lhs_type.bits);
+        switch (op->opcode) {
+        case XAIR_OP_EQ: folded = lhs == rhs; break;
+        case XAIR_OP_NE: folded = lhs != rhs; break;
+        case XAIR_OP_ULT: folded = lhs < rhs; break;
+        case XAIR_OP_ULE: folded = lhs <= rhs; break;
+        case XAIR_OP_SLT: folded = signed_less_u64(lhs, rhs, lhs_type.bits); break;
+        default: folded = signed_less_u64(lhs, rhs, lhs_type.bits) || lhs == rhs; break;
+        }
+        fold_to_const(op, folded, out);
+        return 1;
+
+    case XAIR_OP_ZEXT:
+    case XAIR_OP_SEXT:
+    case XAIR_OP_TRUNC:
+        if (!is_int(out) || out.bits > 64 || !const_u64_value(module, op->src[0], &lhs)) {
+            return 0;
+        }
+        lhs_type = module->values[op->src[0]].type;
+        if (op->opcode == XAIR_OP_SEXT && (lhs & sign_bit_for_bits(lhs_type.bits)) != 0) {
+            folded = lhs | ~mask_for_bits(lhs_type.bits);
+        } else {
+            folded = lhs;
+        }
+        fold_to_const(op, folded, out);
+        return 1;
+
+    case XAIR_OP_CONCAT:
+        if (!is_int(out) || out.bits > 64 ||
+            !const_u64_value(module, op->src[0], &lhs) ||
+            !const_u64_value(module, op->src[1], &rhs)) {
+            return 0;
+        }
+        lhs_type = module->values[op->src[0]].type;
+        folded = (lhs << module->values[op->src[1]].type.bits) | rhs;
+        fold_to_const(op, folded, out);
+        return 1;
+
+    case XAIR_OP_ADDR_ADD:
+    case XAIR_OP_ADDR_SUB:
+        if (!is_addr(out) || out.bits > 64 ||
+            !const_u64_value(module, op->src[0], &lhs) ||
+            !const_u64_value(module, op->src[1], &rhs)) {
+            return 0;
+        }
+        folded = op->opcode == XAIR_OP_ADDR_ADD ? lhs + rhs : lhs - rhs;
+        fold_to_const(op, folded, out);
+        return 1;
+
+    case XAIR_OP_FLAG_ZF:
+    case XAIR_OP_FLAG_CF:
+    case XAIR_OP_FLAG_OF:
+    case XAIR_OP_FLAG_SF:
+        if (!compute_flag_extract(module, op->opcode, op->src[0], &folded)) {
+            return 0;
+        }
+        fold_to_const(op, folded, out);
+        return 1;
+
+    default:
+        return 0;
+    }
+}
+
+static int op_is_commutative(xair_opcode opcode) {
+    switch (opcode) {
+    case XAIR_OP_ADD:
+    case XAIR_OP_MUL:
+    case XAIR_OP_AND:
+    case XAIR_OP_OR:
+    case XAIR_OP_XOR:
+    case XAIR_OP_EQ:
+    case XAIR_OP_NE:
+    case XAIR_OP_FLAGS_ADD:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int compare_value_order(const xair_module *module, xair_value_id lhs, xair_value_id rhs) {
+    uint64_t lhs_const;
+    uint64_t rhs_const;
+    int lhs_is_const;
+    int rhs_is_const;
+    xair_type lhs_type;
+    xair_type rhs_type;
+    int name_cmp;
+
+    lhs_is_const = const_u64_value(module, lhs, &lhs_const);
+    rhs_is_const = const_u64_value(module, rhs, &rhs_const);
+    if (lhs_is_const != rhs_is_const) {
+        return lhs_is_const ? 1 : -1;
+    }
+    lhs_type = module->values[lhs].type;
+    rhs_type = module->values[rhs].type;
+    if (lhs_type.kind != rhs_type.kind) {
+        return lhs_type.kind < rhs_type.kind ? -1 : 1;
+    }
+    if (lhs_type.bits != rhs_type.bits) {
+        return lhs_type.bits < rhs_type.bits ? -1 : 1;
+    }
+    if (lhs_type.aux != rhs_type.aux) {
+        return lhs_type.aux < rhs_type.aux ? -1 : 1;
+    }
+    if (lhs_is_const && lhs_const != rhs_const) {
+        return lhs_const < rhs_const ? -1 : 1;
+    }
+    name_cmp = strcmp(module->values[lhs].name, module->values[rhs].name);
+    if (name_cmp != 0) {
+        return name_cmp;
+    }
+    if (lhs == rhs) {
+        return 0;
+    }
+    return lhs < rhs ? -1 : 1;
+}
+
+static void canonicalize_local_ops(xair_module *module, xair_canonicalize_stats *stats) {
+    size_t i;
+
+    for (i = 0; i < module->op_count; ++i) {
+        xair_op_rec *op = &module->ops[i];
+        if (fold_constant_op(module, op)) {
+            stats->constants_folded++;
+        }
+        if (op->src_count == 2 && op_is_commutative(op->opcode) &&
+            compare_value_order(module, op->src[0], op->src[1]) > 0) {
+            xair_value_id tmp = op->src[0];
+            op->src[0] = op->src[1];
+            op->src[1] = tmp;
+            stats->operands_reordered++;
+        }
+    }
+}
+
+static void mark_live_value(const xair_module *module, unsigned char *live, xair_value_id value) {
+    xair_op_id op_id;
+    const xair_op_rec *op;
+    size_t i;
+
+    if (!valid_value(module, value) || live[value]) {
+        return;
+    }
+    live[value] = 1;
+    op_id = module->values[value].op;
+    if (op_id == XAIR_INVALID_ID || op_id >= module->op_count) {
+        return;
+    }
+    op = &module->ops[op_id];
+    for (i = 0; i < op->src_count; ++i) {
+        mark_live_value(module, live, op->src[i]);
+    }
+}
+
+static void mark_term_live_values(const xair_module *module, const xair_block_rec *block, unsigned char *live) {
+    size_t i;
+
+    switch (block->term.kind) {
+    case XAIR_TERM_JUMP:
+    case XAIR_TERM_RETURN:
+        for (i = 0; i < block->term.true_arg_count; ++i) {
+            mark_live_value(module, live, block->term.true_args[i]);
+        }
+        break;
+    case XAIR_TERM_CBRANCH:
+        mark_live_value(module, live, block->term.condition);
+        for (i = 0; i < block->term.true_arg_count; ++i) {
+            mark_live_value(module, live, block->term.true_args[i]);
+        }
+        for (i = 0; i < block->term.false_arg_count; ++i) {
+            mark_live_value(module, live, block->term.false_args[i]);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static void remap_args(const xair_value_id *value_map, xair_value_id *args, size_t arg_count) {
+    size_t i;
+
+    for (i = 0; i < arg_count; ++i) {
+        args[i] = value_map[args[i]];
+    }
+}
+
+static xair_status compact_live_values(
+    xair_module *module,
+    const unsigned char *live,
+    xair_canonicalize_stats *stats) {
+    xair_value_id *value_map;
+    xair_op_id *op_map;
+    xair_value_rec *new_values;
+    xair_op_rec *new_ops;
+    size_t old_value_count = module->value_count;
+    size_t old_op_count = module->op_count;
+    size_t new_value_count = 0;
+    size_t new_op_count = 0;
+    size_t block_i;
+    size_t i;
+
+    value_map = (xair_value_id *)malloc((old_value_count ? old_value_count : 1) * sizeof(*value_map));
+    op_map = (xair_op_id *)malloc((old_op_count ? old_op_count : 1) * sizeof(*op_map));
+    if (value_map == NULL || op_map == NULL) {
+        free(value_map);
+        free(op_map);
+        return XAIR_ERR_OOM;
+    }
+    for (i = 0; i < old_value_count; ++i) {
+        value_map[i] = XAIR_INVALID_ID;
+    }
+    for (i = 0; i < old_op_count; ++i) {
+        op_map[i] = XAIR_INVALID_ID;
+    }
+
+    for (block_i = 0; block_i < module->block_count; ++block_i) {
+        const xair_block_rec *block = &module->blocks[block_i];
+        for (i = 0; i < block->param_count; ++i) {
+            value_map[block->params[i]] = (xair_value_id)new_value_count++;
+        }
+        for (i = 0; i < block->op_count; ++i) {
+            xair_op_id op_id = block->ops[i];
+            xair_value_id dst = module->ops[op_id].dst;
+            if (live[dst]) {
+                value_map[dst] = (xair_value_id)new_value_count++;
+                op_map[op_id] = (xair_op_id)new_op_count++;
+            }
+        }
+    }
+
+    if (new_value_count == old_value_count && new_op_count == old_op_count) {
+        free(value_map);
+        free(op_map);
+        return XAIR_OK;
+    }
+
+    new_values = (xair_value_rec *)calloc(new_value_count ? new_value_count : 1, sizeof(*new_values));
+    new_ops = (xair_op_rec *)calloc(new_op_count ? new_op_count : 1, sizeof(*new_ops));
+    if (new_values == NULL || new_ops == NULL) {
+        free(value_map);
+        free(op_map);
+        free(new_values);
+        free(new_ops);
+        return XAIR_ERR_OOM;
+    }
+
+    for (i = 0; i < old_value_count; ++i) {
+        if (value_map[i] != XAIR_INVALID_ID) {
+            new_values[value_map[i]] = module->values[i];
+            new_values[value_map[i]].op = XAIR_INVALID_ID;
+        }
+    }
+
+    for (block_i = 0; block_i < module->block_count; ++block_i) {
+        xair_block_rec *block = &module->blocks[block_i];
+        size_t kept_ops = 0;
+
+        for (i = 0; i < block->param_count; ++i) {
+            block->params[i] = value_map[block->params[i]];
+        }
+        for (i = 0; i < block->op_count; ++i) {
+            xair_op_id old_op_id = block->ops[i];
+            xair_op_id new_op_id = op_map[old_op_id];
+            if (new_op_id != XAIR_INVALID_ID) {
+                xair_op_rec new_op = module->ops[old_op_id];
+                size_t src_i;
+
+                new_op.dst = value_map[new_op.dst];
+                for (src_i = 0; src_i < new_op.src_count; ++src_i) {
+                    new_op.src[src_i] = value_map[new_op.src[src_i]];
+                }
+                new_ops[new_op_id] = new_op;
+                new_values[new_op.dst].op = new_op_id;
+                block->ops[kept_ops++] = new_op_id;
+            }
+        }
+        block->op_count = kept_ops;
+
+        switch (block->term.kind) {
+        case XAIR_TERM_JUMP:
+        case XAIR_TERM_RETURN:
+            remap_args(value_map, block->term.true_args, block->term.true_arg_count);
+            break;
+        case XAIR_TERM_CBRANCH:
+            block->term.condition = value_map[block->term.condition];
+            remap_args(value_map, block->term.true_args, block->term.true_arg_count);
+            remap_args(value_map, block->term.false_args, block->term.false_arg_count);
+            break;
+        default:
+            break;
+        }
+    }
+
+    stats->dead_values_removed += old_value_count - new_value_count;
+    stats->dead_operations_removed += old_op_count - new_op_count;
+
+    free(module->values);
+    free(module->ops);
+    module->values = new_values;
+    module->value_count = new_value_count;
+    module->value_cap = new_value_count;
+    module->ops = new_ops;
+    module->op_count = new_op_count;
+    module->op_cap = new_op_count;
+
+    free(value_map);
+    free(op_map);
+    return XAIR_OK;
+}
+
+static xair_status eliminate_dead_values(xair_module *module, xair_canonicalize_stats *stats) {
+    unsigned char *live;
+    size_t block_i;
+    size_t i;
+    xair_status status;
+
+    live = (unsigned char *)calloc(module->value_count ? module->value_count : 1, sizeof(*live));
+    if (live == NULL) {
+        return XAIR_ERR_OOM;
+    }
+
+    for (block_i = 0; block_i < module->block_count; ++block_i) {
+        const xair_block_rec *block = &module->blocks[block_i];
+        for (i = 0; i < block->param_count; ++i) {
+            mark_live_value(module, live, block->params[i]);
+        }
+        mark_term_live_values(module, block, live);
+    }
+
+    status = compact_live_values(module, live, stats);
+    free(live);
+    return status;
+}
+
+xair_status xair_canonicalize_module(
+    xair_module *module,
+    xair_canonicalize_stats *out_stats,
+    xair_error *error) {
+    xair_canonicalize_stats stats;
+    xair_status status;
+
+    if (module == NULL) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    memset(&stats, 0, sizeof(stats));
+    stats.values_before = module->value_count;
+    stats.operations_before = module->op_count;
+
+    status = xair_verify_module(module, error);
+    if (status != XAIR_OK) {
+        return status;
+    }
+
+    canonicalize_local_ops(module, &stats);
+    status = eliminate_dead_values(module, &stats);
+    if (status != XAIR_OK) {
+        return status;
+    }
+
+    status = xair_verify_module(module, error);
+    if (status != XAIR_OK) {
+        return status;
+    }
+
+    stats.values_after = module->value_count;
+    stats.operations_after = module->op_count;
+    if (out_stats != NULL) {
+        *out_stats = stats;
+    }
+    return XAIR_OK;
+}
+
 static void print_append(xair_printer *printer, const char *fmt, ...) {
     va_list ap;
     int written;

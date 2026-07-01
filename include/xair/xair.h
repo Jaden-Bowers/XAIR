@@ -84,6 +84,25 @@ typedef struct {
     char message[192];
 } xair_error;
 
+typedef struct {
+    size_t blocks;
+    size_t values;
+    size_t operations;
+    size_t block_parameters;
+    size_t terminator_arguments;
+} xair_module_metrics;
+
+typedef struct {
+    size_t values_before;
+    size_t values_after;
+    size_t operations_before;
+    size_t operations_after;
+    size_t operands_reordered;
+    size_t constants_folded;
+    size_t dead_values_removed;
+    size_t dead_operations_removed;
+} xair_canonicalize_stats;
+
 typedef struct xair_module xair_module;
 
 xair_type xair_type_void(void);
@@ -193,6 +212,16 @@ xair_status xair_set_trap(xair_module *module, xair_block_id block, uint32_t cod
 xair_status xair_set_fault(xair_module *module, xair_block_id block, uint32_t code);
 
 xair_type xair_value_type(const xair_module *module, xair_value_id value);
+
+xair_status xair_get_module_metrics(const xair_module *module, xair_module_metrics *out_metrics);
+xair_status xair_ops_per_instruction(
+    const xair_module *module,
+    size_t machine_instruction_count,
+    double *out_ratio);
+xair_status xair_canonicalize_module(
+    xair_module *module,
+    xair_canonicalize_stats *out_stats,
+    xair_error *error);
 
 xair_status xair_verify_module(const xair_module *module, xair_error *error);
 xair_status xair_format_module(const xair_module *module, char *buffer, size_t buffer_size);
