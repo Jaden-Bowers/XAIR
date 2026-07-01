@@ -223,6 +223,99 @@ static void test_canonicalize_removes_unused_store_and_measures_inflation(void) 
     xair_module_destroy(module);
 }
 
+static void test_exec_flags_branch(void) {
+    xair_module *module = NULL;
+    xair_exec_state *state = NULL;
+    xair_exec_result result;
+    xair_block_id entry;
+    xair_block_id taken;
+    xair_block_id fall;
+    xair_value_id lhs;
+    xair_value_id rhs;
+    xair_value_id flags;
+    xair_value_id zf;
+    xair_value_id one;
+    xair_value_id zero;
+
+    require_ok(xair_module_create(&module));
+    require_ok(xair_block_create(module, "entry", &entry));
+    require_ok(xair_block_create(module, "taken", &taken));
+    require_ok(xair_block_create(module, "fall", &fall));
+
+    require_ok(xair_block_add_param(module, entry, xair_type_i(8), "lhs", &lhs));
+    require_ok(xair_block_add_param(module, entry, xair_type_i(8), "rhs", &rhs));
+    require_ok(xair_build_binary(module, entry, XAIR_OP_FLAGS_ADD, xair_type_flags(6), lhs, rhs, "flags", &flags));
+    require_ok(xair_build_unary(module, entry, XAIR_OP_FLAG_ZF, xair_type_i(1), flags, "zf", &zf));
+    require_ok(xair_set_cbranch(module, entry, zf, taken, NULL, 0, fall, NULL, 0));
+
+    require_ok(xair_build_const_u64(module, taken, xair_type_i(32), 1, "one", &one));
+    require_ok(xair_set_return(module, taken, &one, 1));
+    require_ok(xair_build_const_u64(module, fall, xair_type_i(32), 0, "zero", &zero));
+    require_ok(xair_set_return(module, fall, &zero, 1));
+
+    require_ok(xair_exec_state_create(module, &state));
+    require_ok(xair_exec_set_param(state, lhs, xair_exec_i(8, 0xff)));
+    require_ok(xair_exec_set_param(state, rhs, xair_exec_i(8, 1)));
+    require_ok(xair_exec_run(module, entry, state, 8, &result));
+    assert(result.kind == XAIR_EXEC_HALTED_RETURN);
+    assert(result.return_count == 1);
+    assert(result.returns[0].lo == 1);
+
+    xair_exec_state_destroy(state);
+    xair_module_destroy(module);
+}
+
+static void test_exec_memory_roundtrip(void) {
+    xair_module *module = NULL;
+    xair_exec_state *state = NULL;
+    xair_exec_result result;
+    xair_block_id entry;
+    xair_value_id mem0;
+    xair_value_id addr;
+    xair_value_id value;
+    xair_value_id mem1;
+    xair_value_id loaded;
+
+    require_ok(xair_module_create(&module));
+    require_ok(xair_block_create(module, "entry", &entry));
+    require_ok(xair_block_add_param(module, entry, xair_type_mem(0, 64), "m0", &mem0));
+    require_ok(xair_block_add_param(module, entry, xair_type_addr(64), "addr", &addr));
+    require_ok(xair_block_add_param(module, entry, xair_type_i(32), "value", &value));
+    require_ok(xair_build_store(module, entry, mem0, addr, value, XAIR_ENDIAN_LE, "m1", &mem1));
+    require_ok(xair_build_load(module, entry, xair_type_i(32), mem1, addr, XAIR_ENDIAN_LE, "loaded", &loaded));
+    require_ok(xair_set_return(module, entry, &loaded, 1));
+
+    require_ok(xair_exec_state_create(module, &state));
+    require_ok(xair_exec_set_param(state, mem0, xair_exec_mem(0, 64)));
+    require_ok(xair_exec_set_param(state, addr, xair_exec_addr(64, 0x1000)));
+    require_ok(xair_exec_set_param(state, value, xair_exec_i(32, 0x11223344)));
+    require_ok(xair_exec_run(module, entry, state, 8, &result));
+    assert(result.kind == XAIR_EXEC_HALTED_RETURN);
+    assert(result.return_count == 1);
+    assert(result.returns[0].lo == 0x11223344);
+
+    xair_exec_state_destroy(state);
+    xair_module_destroy(module);
+}
+
+static void test_exec_step_limit(void) {
+    xair_module *module = NULL;
+    xair_exec_state *state = NULL;
+    xair_exec_result result;
+    xair_block_id entry;
+
+    require_ok(xair_module_create(&module));
+    require_ok(xair_block_create(module, "entry", &entry));
+    require_ok(xair_set_jump(module, entry, entry, NULL, 0));
+
+    require_ok(xair_exec_state_create(module, &state));
+    require_ok(xair_exec_run(module, entry, state, 3, &result));
+    assert(result.kind == XAIR_EXEC_HALTED_STEP_LIMIT);
+
+    xair_exec_state_destroy(state);
+    xair_module_destroy(module);
+}
+
 int main(void) {
     test_flags_and_branch();
     test_memory_versions();
@@ -231,5 +324,8 @@ int main(void) {
     test_canonicalize_folds_constants_and_is_idempotent();
     test_canonicalize_folds_flag_extract_and_removes_flag_summary();
     test_canonicalize_removes_unused_store_and_measures_inflation();
+    test_exec_flags_branch();
+    test_exec_memory_roundtrip();
+    test_exec_step_limit();
     return 0;
 }

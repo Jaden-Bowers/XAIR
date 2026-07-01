@@ -19,7 +19,8 @@ typedef enum {
     XAIR_ERR_OOM,
     XAIR_ERR_BAD_ARG,
     XAIR_ERR_RANGE,
-    XAIR_ERR_VERIFY
+    XAIR_ERR_VERIFY,
+    XAIR_ERR_UNSUPPORTED
 } xair_status;
 
 typedef enum {
@@ -104,6 +105,31 @@ typedef struct {
 } xair_canonicalize_stats;
 
 typedef struct xair_module xair_module;
+typedef struct xair_exec_state xair_exec_state;
+
+#define XAIR_EXEC_MAX_RETURNS 8
+
+typedef enum {
+    XAIR_EXEC_HALTED_RETURN = 0,
+    XAIR_EXEC_HALTED_TRAP,
+    XAIR_EXEC_HALTED_FAULT,
+    XAIR_EXEC_HALTED_STEP_LIMIT,
+    XAIR_EXEC_HALTED_UNSUPPORTED
+} xair_exec_halt_kind;
+
+typedef struct {
+    xair_type type;
+    uint64_t lo;
+    uint64_t hi;
+} xair_exec_value;
+
+typedef struct {
+    xair_exec_halt_kind kind;
+    xair_block_id block;
+    uint32_t code;
+    size_t return_count;
+    xair_exec_value returns[XAIR_EXEC_MAX_RETURNS];
+} xair_exec_result;
 
 xair_type xair_type_void(void);
 xair_type xair_type_i(uint16_t bits);
@@ -225,6 +251,39 @@ xair_status xair_canonicalize_module(
 
 xair_status xair_verify_module(const xair_module *module, xair_error *error);
 xair_status xair_format_module(const xair_module *module, char *buffer, size_t buffer_size);
+
+xair_exec_value xair_exec_i(uint16_t bits, uint64_t value);
+xair_exec_value xair_exec_addr(uint16_t bits, uint64_t value);
+xair_exec_value xair_exec_mem(uint16_t space, uint16_t addr_bits);
+
+xair_status xair_exec_state_create(const xair_module *module, xair_exec_state **out_state);
+void xair_exec_state_destroy(xair_exec_state *state);
+xair_status xair_exec_set_param(
+    xair_exec_state *state,
+    xair_value_id value,
+    xair_exec_value concrete);
+xair_status xair_exec_get_value(
+    const xair_exec_state *state,
+    xair_value_id value,
+    xair_exec_value *out_value);
+xair_status xair_exec_store_bytes(
+    xair_exec_state *state,
+    uint16_t space,
+    uint64_t address,
+    const uint8_t *data,
+    size_t size);
+xair_status xair_exec_load_bytes(
+    const xair_exec_state *state,
+    uint16_t space,
+    uint64_t address,
+    uint8_t *out_data,
+    size_t size);
+xair_status xair_exec_run(
+    const xair_module *module,
+    xair_block_id entry,
+    xair_exec_state *state,
+    size_t step_limit,
+    xair_exec_result *out_result);
 
 #ifdef __cplusplus
 }

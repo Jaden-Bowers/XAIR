@@ -393,6 +393,8 @@ const char *xair_status_name(xair_status status) {
         return "range error";
     case XAIR_ERR_VERIFY:
         return "verification failed";
+    case XAIR_ERR_UNSUPPORTED:
+        return "unsupported operation";
     default:
         return "unknown status";
     }
@@ -1850,4 +1852,764 @@ xair_status xair_format_module(const xair_module *module, char *buffer, size_t b
     }
 
     return printer.truncated ? XAIR_ERR_RANGE : XAIR_OK;
+}
+
+#define XAIR_EXEC_PAGE_BITS 12
+#define XAIR_EXEC_PAGE_SIZE ((size_t)1u << XAIR_EXEC_PAGE_BITS)
+#define XAIR_EXEC_PAGE_MASK ((uint64_t)(XAIR_EXEC_PAGE_SIZE - 1u))
+#define XAIR_EXEC_FLAG_ZF UINT64_C(1)
+#define XAIR_EXEC_FLAG_CF UINT64_C(2)
+#define XAIR_EXEC_FLAG_OF UINT64_C(4)
+#define XAIR_EXEC_FLAG_SF UINT64_C(8)
+
+typedef struct {
+    uint16_t space;
+    uint64_t number;
+    uint8_t bytes[XAIR_EXEC_PAGE_SIZE];
+    uint8_t defined[XAIR_EXEC_PAGE_SIZE];
+} xair_exec_page;
+
+struct xair_exec_state {
+    const xair_module *module;
+    xair_exec_value *values;
+    uint8_t *defined;
+    size_t value_count;
+    xair_exec_page *pages;
+    size_t page_count;
+    size_t page_cap;
+    uint64_t mem_generation;
+};
+
+static xair_exec_value exec_value_make(xair_type type, uint64_t lo, uint64_t hi) {
+    xair_exec_value value;
+
+    value.type = type;
+    value.lo = truncate_to_type(lo, type);
+    value.hi = hi;
+    return value;
+}
+
+xair_exec_value xair_exec_i(uint16_t bits, uint64_t value) {
+    return exec_value_make(xair_type_i(bits), value, 0);
+}
+
+xair_exec_value xair_exec_addr(uint16_t bits, uint64_t value) {
+    return exec_value_make(xair_type_addr(bits), value, 0);
+}
+
+xair_exec_value xair_exec_mem(uint16_t space, uint16_t addr_bits) {
+    return exec_value_make(xair_type_mem(space, addr_bits), 0, 0);
+}
+
+static int exec_scalar_u64_type(xair_type type) {
+    return (is_int(type) || is_addr(type)) && type.bits <= 64;
+}
+
+static int exec_byte_sized_scalar(xair_type type, size_t *out_size) {
+    if (!exec_scalar_u64_type(type) || type.bits == 1 || (type.bits % 8u) != 0u) {
+        return 0;
+    }
+    *out_size = (size_t)(type.bits / 8u);
+    return 1;
+}
+
+static xair_status exec_check_value_slot(const xair_exec_state *state, xair_value_id value) {
+    if (state == NULL || value >= state->value_count || state->module == NULL) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    if (value >= state->module->value_count) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    return XAIR_OK;
+}
+
+static xair_status exec_define_value(
+    xair_exec_state *state,
+    xair_value_id value,
+    xair_exec_value concrete) {
+    xair_status status = exec_check_value_slot(state, value);
+    xair_type expected;
+
+    if (status != XAIR_OK) {
+        return status;
+    }
+    expected = state->module->values[value].type;
+    if (!xair_type_equal(expected, concrete.type)) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    state->values[value] = concrete;
+    state->defined[value] = 1;
+    return XAIR_OK;
+}
+
+static xair_status exec_read_value(
+    const xair_exec_state *state,
+    xair_value_id value,
+    xair_exec_value *out_value) {
+    xair_status status;
+
+    if (out_value == NULL) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    status = exec_check_value_slot(state, value);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    if (!state->defined[value]) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    *out_value = state->values[value];
+    return XAIR_OK;
+}
+
+static xair_exec_page *exec_find_page_mut(xair_exec_state *state, uint16_t space, uint64_t number) {
+    size_t i;
+
+    for (i = 0; i < state->page_count; ++i) {
+        xair_exec_page *page = &state->pages[i];
+        if (page->space == space && page->number == number) {
+            return page;
+        }
+    }
+    return NULL;
+}
+
+static const xair_exec_page *exec_find_page_const(
+    const xair_exec_state *state,
+    uint16_t space,
+    uint64_t number) {
+    size_t i;
+
+    for (i = 0; i < state->page_count; ++i) {
+        const xair_exec_page *page = &state->pages[i];
+        if (page->space == space && page->number == number) {
+            return page;
+        }
+    }
+    return NULL;
+}
+
+static xair_status exec_get_or_create_page(
+    xair_exec_state *state,
+    uint16_t space,
+    uint64_t number,
+    xair_exec_page **out_page) {
+    xair_exec_page *page;
+    xair_status status;
+
+    page = exec_find_page_mut(state, space, number);
+    if (page != NULL) {
+        *out_page = page;
+        return XAIR_OK;
+    }
+    status = grow_array(
+        (void **)&state->pages,
+        sizeof(*state->pages),
+        &state->page_cap,
+        state->page_count + 1);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    page = &state->pages[state->page_count++];
+    memset(page, 0, sizeof(*page));
+    page->space = space;
+    page->number = number;
+    *out_page = page;
+    return XAIR_OK;
+}
+
+static int exec_range_wraps(uint64_t address, size_t size) {
+    return size != 0 && (uint64_t)(size - 1u) > UINT64_MAX - address;
+}
+
+xair_status xair_exec_store_bytes(
+    xair_exec_state *state,
+    uint16_t space,
+    uint64_t address,
+    const uint8_t *data,
+    size_t size) {
+    size_t i;
+
+    if (state == NULL || (data == NULL && size != 0) || exec_range_wraps(address, size)) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    for (i = 0; i < size; ++i) {
+        uint64_t current = address + (uint64_t)i;
+        uint64_t page_number = current >> XAIR_EXEC_PAGE_BITS;
+        size_t offset = (size_t)(current & XAIR_EXEC_PAGE_MASK);
+        xair_exec_page *page;
+        xair_status status = exec_get_or_create_page(state, space, page_number, &page);
+
+        if (status != XAIR_OK) {
+            return status;
+        }
+        page->bytes[offset] = data[i];
+        page->defined[offset] = 1;
+    }
+    return XAIR_OK;
+}
+
+xair_status xair_exec_load_bytes(
+    const xair_exec_state *state,
+    uint16_t space,
+    uint64_t address,
+    uint8_t *out_data,
+    size_t size) {
+    size_t i;
+
+    if (state == NULL || (out_data == NULL && size != 0) || exec_range_wraps(address, size)) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    for (i = 0; i < size; ++i) {
+        uint64_t current = address + (uint64_t)i;
+        uint64_t page_number = current >> XAIR_EXEC_PAGE_BITS;
+        size_t offset = (size_t)(current & XAIR_EXEC_PAGE_MASK);
+        const xair_exec_page *page = exec_find_page_const(state, space, page_number);
+
+        if (page == NULL || !page->defined[offset]) {
+            return XAIR_ERR_RANGE;
+        }
+        out_data[i] = page->bytes[offset];
+    }
+    return XAIR_OK;
+}
+
+static xair_status exec_store_u64(
+    xair_exec_state *state,
+    uint16_t space,
+    uint64_t address,
+    uint64_t value,
+    size_t size,
+    xair_endian endian) {
+    uint8_t bytes[8];
+    size_t i;
+
+    if (size > sizeof(bytes)) {
+        return XAIR_ERR_UNSUPPORTED;
+    }
+    for (i = 0; i < size; ++i) {
+        size_t shift_index = endian == XAIR_ENDIAN_LE ? i : (size - 1u - i);
+        bytes[i] = (uint8_t)((value >> (shift_index * 8u)) & 0xffu);
+    }
+    return xair_exec_store_bytes(state, space, address, bytes, size);
+}
+
+static xair_status exec_load_u64(
+    const xair_exec_state *state,
+    uint16_t space,
+    uint64_t address,
+    size_t size,
+    xair_endian endian,
+    uint64_t *out_value) {
+    uint8_t bytes[8];
+    size_t i;
+    uint64_t value = 0;
+    xair_status status;
+
+    if (out_value == NULL || size > sizeof(bytes)) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    status = xair_exec_load_bytes(state, space, address, bytes, size);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    for (i = 0; i < size; ++i) {
+        size_t shift_index = endian == XAIR_ENDIAN_LE ? i : (size - 1u - i);
+        value |= ((uint64_t)bytes[i]) << (shift_index * 8u);
+    }
+    *out_value = value;
+    return XAIR_OK;
+}
+
+xair_status xair_exec_state_create(const xair_module *module, xair_exec_state **out_state) {
+    xair_exec_state *state;
+    xair_status status;
+
+    if (module == NULL || out_state == NULL) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    status = xair_verify_module(module, NULL);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    state = (xair_exec_state *)calloc(1, sizeof(*state));
+    if (state == NULL) {
+        return XAIR_ERR_OOM;
+    }
+    state->module = module;
+    state->value_count = module->value_count;
+    if (state->value_count != 0) {
+        state->values = (xair_exec_value *)calloc(state->value_count, sizeof(*state->values));
+        state->defined = (uint8_t *)calloc(state->value_count, sizeof(*state->defined));
+        if (state->values == NULL || state->defined == NULL) {
+            xair_exec_state_destroy(state);
+            return XAIR_ERR_OOM;
+        }
+    }
+    *out_state = state;
+    return XAIR_OK;
+}
+
+void xair_exec_state_destroy(xair_exec_state *state) {
+    if (state == NULL) {
+        return;
+    }
+    free(state->values);
+    free(state->defined);
+    free(state->pages);
+    free(state);
+}
+
+xair_status xair_exec_set_param(
+    xair_exec_state *state,
+    xair_value_id value,
+    xair_exec_value concrete) {
+    xair_status status;
+
+    status = exec_check_value_slot(state, value);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    if (state->module->values[value].op != XAIR_INVALID_ID) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    return exec_define_value(state, value, concrete);
+}
+
+xair_status xair_exec_get_value(
+    const xair_exec_state *state,
+    xair_value_id value,
+    xair_exec_value *out_value) {
+    return exec_read_value(state, value, out_value);
+}
+
+static uint64_t exec_flags(xair_opcode opcode, uint64_t lhs, uint64_t rhs, uint16_t bits) {
+    uint64_t mask = mask_for_bits(bits);
+    uint64_t sign = sign_bit_for_bits(bits);
+    uint64_t result;
+    uint64_t packed = 0;
+    int lhs_sign;
+    int rhs_sign;
+    int result_sign;
+
+    lhs &= mask;
+    rhs &= mask;
+    result = opcode == XAIR_OP_FLAGS_ADD ? (lhs + rhs) & mask : (lhs - rhs) & mask;
+    lhs_sign = (lhs & sign) != 0;
+    rhs_sign = (rhs & sign) != 0;
+    result_sign = (result & sign) != 0;
+
+    if (result == 0) {
+        packed |= XAIR_EXEC_FLAG_ZF;
+    }
+    if (opcode == XAIR_OP_FLAGS_ADD ? result < lhs : lhs < rhs) {
+        packed |= XAIR_EXEC_FLAG_CF;
+    }
+    if (opcode == XAIR_OP_FLAGS_ADD) {
+        if ((lhs_sign == rhs_sign) && (result_sign != lhs_sign)) {
+            packed |= XAIR_EXEC_FLAG_OF;
+        }
+    } else if ((lhs_sign != rhs_sign) && (result_sign != lhs_sign)) {
+        packed |= XAIR_EXEC_FLAG_OF;
+    }
+    if (result_sign) {
+        packed |= XAIR_EXEC_FLAG_SF;
+    }
+    return packed;
+}
+
+static xair_status exec_binary_op(
+    xair_exec_state *state,
+    const xair_op_rec *op,
+    xair_type out,
+    xair_exec_value lhs,
+    xair_exec_value rhs) {
+    uint64_t mask;
+    uint64_t result;
+    uint64_t shift;
+
+    if (!exec_scalar_u64_type(lhs.type) || lhs.type.bits > 64 || rhs.type.bits > 64) {
+        return XAIR_ERR_UNSUPPORTED;
+    }
+    mask = mask_for_bits(lhs.type.bits);
+    lhs.lo &= mask;
+    rhs.lo &= mask_for_bits(rhs.type.bits);
+
+    switch (op->opcode) {
+    case XAIR_OP_ADD:
+        result = lhs.lo + rhs.lo;
+        break;
+    case XAIR_OP_SUB:
+        result = lhs.lo - rhs.lo;
+        break;
+    case XAIR_OP_MUL:
+        result = lhs.lo * rhs.lo;
+        break;
+    case XAIR_OP_AND:
+        result = lhs.lo & rhs.lo;
+        break;
+    case XAIR_OP_OR:
+        result = lhs.lo | rhs.lo;
+        break;
+    case XAIR_OP_XOR:
+        result = lhs.lo ^ rhs.lo;
+        break;
+    case XAIR_OP_SHL:
+        shift = rhs.lo;
+        if (shift >= lhs.type.bits) {
+            return XAIR_ERR_UNSUPPORTED;
+        }
+        result = lhs.lo << shift;
+        break;
+    case XAIR_OP_LSHR:
+        shift = rhs.lo;
+        if (shift >= lhs.type.bits) {
+            return XAIR_ERR_UNSUPPORTED;
+        }
+        result = lhs.lo >> shift;
+        break;
+    case XAIR_OP_ASHR:
+        shift = rhs.lo;
+        if (shift >= lhs.type.bits) {
+            return XAIR_ERR_UNSUPPORTED;
+        }
+        if (shift == 0) {
+            result = lhs.lo;
+        } else if ((lhs.lo & sign_bit_for_bits(lhs.type.bits)) != 0) {
+            result = (lhs.lo >> shift) | (mask << (lhs.type.bits - shift));
+        } else {
+            result = lhs.lo >> shift;
+        }
+        break;
+    case XAIR_OP_EQ:
+        result = lhs.lo == rhs.lo;
+        break;
+    case XAIR_OP_NE:
+        result = lhs.lo != rhs.lo;
+        break;
+    case XAIR_OP_ULT:
+        result = lhs.lo < rhs.lo;
+        break;
+    case XAIR_OP_ULE:
+        result = lhs.lo <= rhs.lo;
+        break;
+    case XAIR_OP_SLT:
+        result = signed_less_u64(lhs.lo, rhs.lo, lhs.type.bits);
+        break;
+    case XAIR_OP_SLE:
+        result = signed_less_u64(lhs.lo, rhs.lo, lhs.type.bits) || lhs.lo == rhs.lo;
+        break;
+    case XAIR_OP_CONCAT:
+        if (!is_int(out) || out.bits > 64 || rhs.type.bits >= 64) {
+            return XAIR_ERR_UNSUPPORTED;
+        }
+        result = (lhs.lo << rhs.type.bits) | rhs.lo;
+        break;
+    case XAIR_OP_ADDR_ADD:
+        result = lhs.lo + rhs.lo;
+        break;
+    case XAIR_OP_ADDR_SUB:
+        result = lhs.lo - rhs.lo;
+        break;
+    case XAIR_OP_FLAGS_ADD:
+    case XAIR_OP_FLAGS_SUB:
+        if (!is_int(lhs.type)) {
+            return XAIR_ERR_UNSUPPORTED;
+        }
+        return exec_define_value(
+            state,
+            op->dst,
+            exec_value_make(out, exec_flags(op->opcode, lhs.lo, rhs.lo, lhs.type.bits), 0));
+    default:
+        return XAIR_ERR_UNSUPPORTED;
+    }
+    return exec_define_value(state, op->dst, exec_value_make(out, result, 0));
+}
+
+static xair_status exec_unary_op(
+    xair_exec_state *state,
+    const xair_op_rec *op,
+    xair_type out,
+    xair_exec_value src) {
+    uint64_t result;
+    uint64_t flag;
+
+    switch (op->opcode) {
+    case XAIR_OP_ZEXT:
+    case XAIR_OP_TRUNC:
+        if (!exec_scalar_u64_type(out) || !exec_scalar_u64_type(src.type)) {
+            return XAIR_ERR_UNSUPPORTED;
+        }
+        result = src.lo;
+        break;
+    case XAIR_OP_SEXT:
+        if (!exec_scalar_u64_type(out) || !exec_scalar_u64_type(src.type)) {
+            return XAIR_ERR_UNSUPPORTED;
+        }
+        if ((src.lo & sign_bit_for_bits(src.type.bits)) != 0) {
+            result = src.lo | ~mask_for_bits(src.type.bits);
+        } else {
+            result = src.lo;
+        }
+        break;
+    case XAIR_OP_FLAG_ZF:
+        flag = XAIR_EXEC_FLAG_ZF;
+        result = (src.lo & flag) != 0;
+        break;
+    case XAIR_OP_FLAG_CF:
+        flag = XAIR_EXEC_FLAG_CF;
+        result = (src.lo & flag) != 0;
+        break;
+    case XAIR_OP_FLAG_OF:
+        flag = XAIR_EXEC_FLAG_OF;
+        result = (src.lo & flag) != 0;
+        break;
+    case XAIR_OP_FLAG_SF:
+        flag = XAIR_EXEC_FLAG_SF;
+        result = (src.lo & flag) != 0;
+        break;
+    default:
+        return XAIR_ERR_UNSUPPORTED;
+    }
+    return exec_define_value(state, op->dst, exec_value_make(out, result, 0));
+}
+
+static xair_status exec_memory_op(xair_exec_state *state, const xair_op_rec *op, xair_type out) {
+    xair_exec_value memory;
+    xair_exec_value address;
+    xair_status status;
+    size_t size;
+
+    status = exec_read_value(state, op->src[0], &memory);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    status = exec_read_value(state, op->src[1], &address);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    if (!is_mem(memory.type) || !is_addr(address.type)) {
+        return XAIR_ERR_BAD_ARG;
+    }
+
+    if (op->opcode == XAIR_OP_LOAD) {
+        uint64_t loaded;
+
+        if (!exec_byte_sized_scalar(out, &size)) {
+            return XAIR_ERR_UNSUPPORTED;
+        }
+        status = exec_load_u64(state, memory.type.aux, address.lo, size, (xair_endian)op->endian, &loaded);
+        if (status != XAIR_OK) {
+            return status;
+        }
+        return exec_define_value(state, op->dst, exec_value_make(out, loaded, 0));
+    }
+    if (op->opcode == XAIR_OP_STORE) {
+        xair_exec_value data;
+
+        status = exec_read_value(state, op->src[2], &data);
+        if (status != XAIR_OK) {
+            return status;
+        }
+        if (!exec_byte_sized_scalar(data.type, &size)) {
+            return XAIR_ERR_UNSUPPORTED;
+        }
+        status = exec_store_u64(state, memory.type.aux, address.lo, data.lo, size, (xair_endian)op->endian);
+        if (status != XAIR_OK) {
+            return status;
+        }
+        ++state->mem_generation;
+        return exec_define_value(state, op->dst, exec_value_make(out, state->mem_generation, 0));
+    }
+    return XAIR_ERR_UNSUPPORTED;
+}
+
+static xair_status exec_op(xair_exec_state *state, const xair_op_rec *op) {
+    xair_type out = state->module->values[op->dst].type;
+    xair_status status;
+
+    if (op->opcode == XAIR_OP_CONST_U64) {
+        return exec_define_value(state, op->dst, exec_value_make(out, op->imm, 0));
+    }
+    if (op->opcode == XAIR_OP_LOAD || op->opcode == XAIR_OP_STORE) {
+        return exec_memory_op(state, op, out);
+    }
+    if (op->src_count == 1) {
+        xair_exec_value src;
+
+        status = exec_read_value(state, op->src[0], &src);
+        if (status != XAIR_OK) {
+            return status;
+        }
+        return exec_unary_op(state, op, out, src);
+    }
+    if (op->src_count == 2) {
+        xair_exec_value lhs;
+        xair_exec_value rhs;
+
+        status = exec_read_value(state, op->src[0], &lhs);
+        if (status != XAIR_OK) {
+            return status;
+        }
+        status = exec_read_value(state, op->src[1], &rhs);
+        if (status != XAIR_OK) {
+            return status;
+        }
+        return exec_binary_op(state, op, out, lhs, rhs);
+    }
+    return XAIR_ERR_UNSUPPORTED;
+}
+
+static xair_status exec_transfer_args(
+    xair_exec_state *state,
+    xair_block_id target,
+    const xair_value_id *args,
+    size_t arg_count) {
+    const xair_block_rec *block;
+    xair_exec_value *copies;
+    size_t i;
+
+    if (!valid_block(state->module, target)) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    block = &state->module->blocks[target];
+    if (block->param_count != arg_count) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    if (arg_count == 0) {
+        return XAIR_OK;
+    }
+    copies = (xair_exec_value *)malloc(arg_count * sizeof(*copies));
+    if (copies == NULL) {
+        return XAIR_ERR_OOM;
+    }
+    for (i = 0; i < arg_count; ++i) {
+        xair_status status = exec_read_value(state, args[i], &copies[i]);
+        if (status != XAIR_OK) {
+            free(copies);
+            return status;
+        }
+    }
+    for (i = 0; i < arg_count; ++i) {
+        xair_status status = exec_define_value(state, block->params[i], copies[i]);
+        if (status != XAIR_OK) {
+            free(copies);
+            return status;
+        }
+    }
+    free(copies);
+    return XAIR_OK;
+}
+
+static void exec_set_result(
+    xair_exec_result *result,
+    xair_exec_halt_kind kind,
+    xair_block_id block,
+    uint32_t code) {
+    if (result == NULL) {
+        return;
+    }
+    memset(result, 0, sizeof(*result));
+    result->kind = kind;
+    result->block = block;
+    result->code = code;
+}
+
+xair_status xair_exec_run(
+    const xair_module *module,
+    xair_block_id entry,
+    xair_exec_state *state,
+    size_t step_limit,
+    xair_exec_result *out_result) {
+    xair_block_id current = entry;
+    size_t steps = 0;
+
+    if (module == NULL || state == NULL || out_result == NULL || state->module != module ||
+        state->value_count != module->value_count || !valid_block(module, entry)) {
+        return XAIR_ERR_BAD_ARG;
+    }
+
+    for (;;) {
+        const xair_block_rec *block;
+        size_t i;
+        xair_status status;
+
+        if (steps >= step_limit) {
+            exec_set_result(out_result, XAIR_EXEC_HALTED_STEP_LIMIT, current, 0);
+            return XAIR_OK;
+        }
+        ++steps;
+
+        block = &module->blocks[current];
+        for (i = 0; i < block->op_count; ++i) {
+            const xair_op_rec *op = &module->ops[block->ops[i]];
+
+            status = exec_op(state, op);
+            if (status == XAIR_ERR_UNSUPPORTED) {
+                exec_set_result(out_result, XAIR_EXEC_HALTED_UNSUPPORTED, current, (uint32_t)op->opcode);
+                return XAIR_OK;
+            }
+            if (status != XAIR_OK) {
+                return status;
+            }
+        }
+
+        switch (block->term.kind) {
+        case XAIR_TERM_JUMP:
+            status = exec_transfer_args(
+                state,
+                block->term.true_target,
+                block->term.true_args,
+                block->term.true_arg_count);
+            if (status != XAIR_OK) {
+                return status;
+            }
+            current = block->term.true_target;
+            break;
+        case XAIR_TERM_CBRANCH: {
+            xair_exec_value condition;
+            int take_true;
+
+            status = exec_read_value(state, block->term.condition, &condition);
+            if (status != XAIR_OK) {
+                return status;
+            }
+            if (!is_i1(condition.type)) {
+                return XAIR_ERR_BAD_ARG;
+            }
+            take_true = (condition.lo & 1u) != 0;
+            status = exec_transfer_args(
+                state,
+                take_true ? block->term.true_target : block->term.false_target,
+                take_true ? block->term.true_args : block->term.false_args,
+                take_true ? block->term.true_arg_count : block->term.false_arg_count);
+            if (status != XAIR_OK) {
+                return status;
+            }
+            current = take_true ? block->term.true_target : block->term.false_target;
+            break;
+        }
+        case XAIR_TERM_RETURN:
+            if (block->term.true_arg_count > XAIR_EXEC_MAX_RETURNS) {
+                return XAIR_ERR_RANGE;
+            }
+            exec_set_result(out_result, XAIR_EXEC_HALTED_RETURN, current, 0);
+            out_result->return_count = block->term.true_arg_count;
+            for (i = 0; i < block->term.true_arg_count; ++i) {
+                status = exec_read_value(state, block->term.true_args[i], &out_result->returns[i]);
+                if (status != XAIR_OK) {
+                    return status;
+                }
+            }
+            return XAIR_OK;
+        case XAIR_TERM_TRAP:
+            exec_set_result(out_result, XAIR_EXEC_HALTED_TRAP, current, block->term.code);
+            return XAIR_OK;
+        case XAIR_TERM_FAULT:
+            exec_set_result(out_result, XAIR_EXEC_HALTED_FAULT, current, block->term.code);
+            return XAIR_OK;
+        default:
+            return XAIR_ERR_BAD_ARG;
+        }
+    }
 }
