@@ -110,6 +110,13 @@ typedef struct {
     size_t dead_operations_removed;
 } xair_canonicalize_stats;
 
+typedef struct {
+    size_t entries;
+    size_t created;
+    size_t reused;
+    size_t collisions;
+} xair_value_numbering_stats;
+
 typedef struct xair_module xair_module;
 typedef struct xair_builder xair_builder;
 typedef struct xair_exec_state xair_exec_state;
@@ -256,6 +263,9 @@ xair_status xair_set_fault(xair_module *module, xair_block_id block, uint32_t co
 xair_type xair_value_type(const xair_module *module, xair_value_id value);
 
 xair_status xair_get_module_metrics(const xair_module *module, xair_module_metrics *out_metrics);
+xair_status xair_get_value_numbering_stats(
+    const xair_module *module,
+    xair_value_numbering_stats *out_stats);
 xair_status xair_ops_per_instruction(
     const xair_module *module,
     size_t machine_instruction_count,

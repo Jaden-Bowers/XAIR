@@ -41,6 +41,10 @@ for address values. Address updates must use `addr_add`, `addr_sub`,
 The v0 IR text format is covered by golden tests. Changes to opcode semantics,
 type rules, or printed IR should be treated as versioned changes.
 
+Construction performs local structural value numbering for equivalent constants,
+unary nodes, binary nodes, loads, and stores. This keeps repeated expressions
+from inflating the IR before canonicalization runs.
+
 ## Build
 
 ```sh

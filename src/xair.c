@@ -56,6 +56,12 @@ typedef struct {
     xair_term_rec term;
 } xair_block_rec;
 
+typedef struct {
+    uint64_t hash;
+    xair_value_id value;
+    unsigned char used;
+} xair_value_number_entry;
+
 struct xair_module {
     xair_value_rec *values;
     size_t value_count;
@@ -69,6 +75,10 @@ struct xair_module {
     xair_value_id *term_args;
     size_t term_arg_count;
     size_t term_arg_cap;
+    xair_value_number_entry *value_numbers;
+    size_t value_number_count;
+    size_t value_number_cap;
+    xair_value_numbering_stats value_number_stats;
     int frozen;
 };
 
@@ -201,6 +211,176 @@ static xair_status append_op(xair_block_rec *block, xair_op_id op) {
     return status;
 }
 
+static uint64_t hash_mix_u64(uint64_t hash, uint64_t value) {
+    hash ^= value + UINT64_C(0x9e3779b97f4a7c15) + (hash << 6u) + (hash >> 2u);
+    return hash == 0 ? UINT64_C(0x9e3779b97f4a7c15) : hash;
+}
+
+static uint64_t hash_type(uint64_t hash, xair_type type) {
+    hash = hash_mix_u64(hash, (uint64_t)type.kind);
+    hash = hash_mix_u64(hash, (uint64_t)type.bits);
+    return hash_mix_u64(hash, (uint64_t)type.aux);
+}
+
+static int type_same(xair_type lhs, xair_type rhs) {
+    return lhs.kind == rhs.kind && lhs.bits == rhs.bits && lhs.aux == rhs.aux;
+}
+
+static uint64_t value_number_hash(
+    xair_block_id block,
+    xair_opcode opcode,
+    xair_type type,
+    const xair_value_id *srcs,
+    uint8_t src_count,
+    uint64_t imm,
+    xair_endian endian) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    uint8_t i;
+
+    hash = hash_mix_u64(hash, (uint64_t)block);
+    hash = hash_mix_u64(hash, (uint64_t)opcode);
+    hash = hash_type(hash, type);
+    hash = hash_mix_u64(hash, (uint64_t)src_count);
+    for (i = 0; i < src_count; ++i) {
+        hash = hash_mix_u64(hash, (uint64_t)srcs[i]);
+    }
+    hash = hash_mix_u64(hash, imm);
+    hash = hash_mix_u64(hash, (uint64_t)endian);
+    return hash;
+}
+
+static int value_number_matches(
+    const xair_module *module,
+    xair_value_id value,
+    xair_block_id block,
+    xair_opcode opcode,
+    xair_type type,
+    const xair_value_id *srcs,
+    uint8_t src_count,
+    uint64_t imm,
+    xair_endian endian) {
+    const xair_op_rec *op;
+    xair_op_id op_id;
+    uint8_t i;
+
+    if (!valid_value(module, value) || module->values[value].block != block ||
+        !type_same(module->values[value].type, type)) {
+        return 0;
+    }
+    op_id = module->values[value].op;
+    if (op_id == XAIR_INVALID_ID || op_id >= module->op_count) {
+        return 0;
+    }
+    op = &module->ops[op_id];
+    if (op->opcode != opcode || op->src_count != src_count ||
+        op->imm != imm || op->endian != (uint8_t)endian) {
+        return 0;
+    }
+    for (i = 0; i < src_count; ++i) {
+        if (op->src[i] != srcs[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int value_number_lookup(
+    xair_module *module,
+    uint64_t hash,
+    xair_block_id block,
+    xair_opcode opcode,
+    xair_type type,
+    const xair_value_id *srcs,
+    uint8_t src_count,
+    uint64_t imm,
+    xair_endian endian,
+    xair_value_id *out_value) {
+    size_t index;
+    size_t probes;
+
+    if (module->value_number_cap == 0 || out_value == NULL) {
+        return 0;
+    }
+    index = (size_t)(hash & (module->value_number_cap - 1u));
+    for (probes = 0; probes < module->value_number_cap; ++probes) {
+        const xair_value_number_entry *entry = &module->value_numbers[index];
+        if (!entry->used) {
+            return 0;
+        }
+        if (entry->hash == hash &&
+            value_number_matches(module, entry->value, block, opcode, type, srcs, src_count, imm, endian)) {
+            *out_value = entry->value;
+            ++module->value_number_stats.reused;
+            return 1;
+        }
+        ++module->value_number_stats.collisions;
+        index = (index + 1u) & (module->value_number_cap - 1u);
+    }
+    return 0;
+}
+
+static xair_status value_number_grow(xair_module *module, size_t next_cap) {
+    xair_value_number_entry *old_entries = module->value_numbers;
+    size_t old_cap = module->value_number_cap;
+    size_t i;
+
+    module->value_numbers = (xair_value_number_entry *)calloc(next_cap, sizeof(*module->value_numbers));
+    if (module->value_numbers == NULL) {
+        module->value_numbers = old_entries;
+        return XAIR_ERR_OOM;
+    }
+    module->value_number_cap = next_cap;
+    module->value_number_count = 0;
+    for (i = 0; i < old_cap; ++i) {
+        if (old_entries[i].used) {
+            size_t index = (size_t)(old_entries[i].hash & (module->value_number_cap - 1u));
+            while (module->value_numbers[index].used) {
+                index = (index + 1u) & (module->value_number_cap - 1u);
+            }
+            module->value_numbers[index] = old_entries[i];
+            ++module->value_number_count;
+        }
+    }
+    free(old_entries);
+    return XAIR_OK;
+}
+
+static xair_status value_number_prepare_insert(xair_module *module) {
+    size_t next_cap;
+
+    if (module->value_number_cap != 0 && (module->value_number_count + 1u) * 2u < module->value_number_cap) {
+        return XAIR_OK;
+    }
+    next_cap = module->value_number_cap == 0 ? 64u : module->value_number_cap * 2u;
+    if (next_cap < module->value_number_cap || next_cap > SIZE_MAX / sizeof(*module->value_numbers)) {
+        return XAIR_ERR_OOM;
+    }
+    return value_number_grow(module, next_cap);
+}
+
+static void value_number_insert(xair_module *module, uint64_t hash, xair_value_id value) {
+    size_t index = (size_t)(hash & (module->value_number_cap - 1u));
+
+    while (module->value_numbers[index].used) {
+        index = (index + 1u) & (module->value_number_cap - 1u);
+    }
+    module->value_numbers[index].used = 1u;
+    module->value_numbers[index].hash = hash;
+    module->value_numbers[index].value = value;
+    ++module->value_number_count;
+    ++module->value_number_stats.created;
+}
+
+static void value_number_clear(xair_module *module) {
+    if (module == NULL) {
+        return;
+    }
+    free(module->value_numbers);
+    module->value_numbers = NULL;
+    module->value_number_count = 0;
+    module->value_number_cap = 0;
+}
+
 static int is_int(xair_type type) {
     return type.kind == XAIR_TYPE_INT;
 }
@@ -284,6 +464,7 @@ static xair_status add_op(
     xair_op_id op_id;
     xair_op_rec *op;
     xair_block_rec *block;
+    uint64_t structural_hash;
 
     if (module == NULL || out_value == NULL || module->frozen ||
         !valid_block(module, block_id) || src_count > 3) {
@@ -298,6 +479,25 @@ static xair_status add_op(
     }
     if (module->op_count >= UINT32_MAX) {
         return XAIR_ERR_RANGE;
+    }
+
+    structural_hash = value_number_hash(block_id, opcode, type, srcs, src_count, imm, endian);
+    if (value_number_lookup(
+        module,
+        structural_hash,
+        block_id,
+        opcode,
+        type,
+        srcs,
+        src_count,
+        imm,
+        endian,
+        out_value)) {
+        return XAIR_OK;
+    }
+    status = value_number_prepare_insert(module);
+    if (status != XAIR_OK) {
+        return status;
     }
 
     status = add_value(module, block_id, type, name, &value_id);
@@ -330,6 +530,7 @@ static xair_status add_op(
         module->value_count--;
         return status;
     }
+    value_number_insert(module, structural_hash, value_id);
     *out_value = value_id;
     return XAIR_OK;
 }
@@ -560,6 +761,7 @@ void xair_module_destroy(xair_module *module) {
         free(module->blocks[i].ops);
     }
     free(module->term_args);
+    free(module->value_numbers);
     free(module->blocks);
     free(module->ops);
     free(module->values);
@@ -1222,6 +1424,17 @@ xair_status xair_get_module_metrics(const xair_module *module, xair_module_metri
     return XAIR_OK;
 }
 
+xair_status xair_get_value_numbering_stats(
+    const xair_module *module,
+    xair_value_numbering_stats *out_stats) {
+    if (module == NULL || out_stats == NULL) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    *out_stats = module->value_number_stats;
+    out_stats->entries = module->value_number_count;
+    return XAIR_OK;
+}
+
 xair_status xair_ops_per_instruction(
     const xair_module *module,
     size_t machine_instruction_count,
@@ -1827,6 +2040,7 @@ xair_status xair_canonicalize_module(
         return status;
     }
 
+    value_number_clear(module);
     canonicalize_local_ops(module, &stats);
     status = eliminate_dead_values(module, &stats);
     if (status != XAIR_OK) {

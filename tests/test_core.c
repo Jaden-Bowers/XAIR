@@ -299,6 +299,67 @@ static void test_addr_add_accepts_address_and_integer(void) {
     xair_module_destroy(module);
 }
 
+static void test_structural_value_numbering_reuses_nodes(void) {
+    xair_module *module = NULL;
+    xair_error error;
+    xair_value_numbering_stats stats;
+    xair_canonicalize_stats canon_stats;
+    xair_block_id entry;
+    xair_value_id mem0;
+    xair_value_id addr;
+    xair_value_id value;
+    xair_value_id c0;
+    xair_value_id c1;
+    xair_value_id flags0;
+    xair_value_id flags1;
+    xair_value_id sum0;
+    xair_value_id sum1;
+    xair_value_id load0;
+    xair_value_id load1;
+    xair_value_id store0;
+    xair_value_id store1;
+    xair_value_id returns[3];
+
+    require_ok(xair_module_create(&module));
+    require_ok(xair_block_create(module, "entry", &entry));
+    require_ok(xair_block_add_param(module, entry, xair_type_mem(0, 64), "m0", &mem0));
+    require_ok(xair_block_add_param(module, entry, xair_type_addr(64), "addr", &addr));
+    require_ok(xair_block_add_param(module, entry, xair_type_i(64), "value", &value));
+
+    require_ok(xair_build_const_u64(module, entry, xair_type_i(64), 7, "c0", &c0));
+    require_ok(xair_build_const_u64(module, entry, xair_type_i(64), 7, "c1", &c1));
+    require_ok(xair_build_unary(module, entry, XAIR_OP_FLAGS_LOGIC, xair_type_flags(6), value, "flags0", &flags0));
+    require_ok(xair_build_unary(module, entry, XAIR_OP_FLAGS_LOGIC, xair_type_flags(6), value, "flags1", &flags1));
+    require_ok(xair_build_binary(module, entry, XAIR_OP_ADD, xair_type_i(64), value, c0, "sum0", &sum0));
+    require_ok(xair_build_binary(module, entry, XAIR_OP_ADD, xair_type_i(64), value, c0, "sum1", &sum1));
+    require_ok(xair_build_load(module, entry, xair_type_i(64), mem0, addr, XAIR_ENDIAN_LE, "load0", &load0));
+    require_ok(xair_build_load(module, entry, xair_type_i(64), mem0, addr, XAIR_ENDIAN_LE, "load1", &load1));
+    require_ok(xair_build_store(module, entry, mem0, addr, c0, XAIR_ENDIAN_LE, "store0", &store0));
+    require_ok(xair_build_store(module, entry, mem0, addr, c0, XAIR_ENDIAN_LE, "store1", &store1));
+
+    assert(c0 == c1);
+    assert(flags0 == flags1);
+    assert(sum0 == sum1);
+    assert(load0 == load1);
+    assert(store0 == store1);
+    assert(xair_module_op_count(module) == 5);
+    require_ok(xair_get_value_numbering_stats(module, &stats));
+    assert(stats.entries == 5);
+    assert(stats.created == 5);
+    assert(stats.reused == 5);
+
+    returns[0] = store0;
+    returns[1] = sum0;
+    returns[2] = load0;
+    require_ok(xair_set_return(module, entry, returns, 3));
+    require_ok(xair_verify_module(module, &error));
+    require_ok(xair_canonicalize_module(module, &canon_stats, &error));
+    require_ok(xair_get_value_numbering_stats(module, &stats));
+    assert(stats.entries == 0);
+    assert(stats.reused == 5);
+    xair_module_destroy(module);
+}
+
 static void test_canonicalizes_commutative_order(void) {
     xair_module *module = NULL;
     xair_error error;
@@ -668,6 +729,7 @@ int main(void) {
     test_type_mismatch_is_rejected();
     test_plain_add_rejects_addresses();
     test_addr_add_accepts_address_and_integer();
+    test_structural_value_numbering_reuses_nodes();
     test_canonicalizes_commutative_order();
     test_canonicalize_folds_constants_and_is_idempotent();
     test_canonicalize_folds_flag_extract_and_removes_flag_summary();
