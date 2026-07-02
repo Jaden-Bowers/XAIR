@@ -1443,6 +1443,76 @@ xair_status xair_get_value_numbering_stats(
     return XAIR_OK;
 }
 
+static uint64_t fingerprint_mix_type(uint64_t hash, xair_type type) {
+    hash = hash_mix_u64(hash, (uint64_t)type.kind);
+    hash = hash_mix_u64(hash, (uint64_t)type.bits);
+    return hash_mix_u64(hash, (uint64_t)type.aux);
+}
+
+xair_status xair_module_fingerprint(const xair_module *module, uint64_t *out_hash) {
+    uint64_t hash = UINT64_C(0x584149525f76305f);
+    size_t i;
+
+    if (module == NULL || out_hash == NULL) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    hash = hash_mix_u64(hash, (uint64_t)module->block_count);
+    hash = hash_mix_u64(hash, (uint64_t)module->value_count);
+    hash = hash_mix_u64(hash, (uint64_t)module->op_count);
+    for (i = 0; i < module->value_count; ++i) {
+        const xair_value_rec *value = &module->values[i];
+        hash = hash_mix_u64(hash, (uint64_t)i);
+        hash = fingerprint_mix_type(hash, value->type);
+        hash = hash_mix_u64(hash, (uint64_t)value->block);
+        hash = hash_mix_u64(hash, (uint64_t)value->op);
+    }
+    for (i = 0; i < module->op_count; ++i) {
+        const xair_op_rec *op = &module->ops[i];
+        size_t src_i;
+
+        hash = hash_mix_u64(hash, (uint64_t)i);
+        hash = hash_mix_u64(hash, (uint64_t)op->opcode);
+        hash = hash_mix_u64(hash, (uint64_t)op->dst);
+        hash = hash_mix_u64(hash, (uint64_t)op->src_count);
+        for (src_i = 0; src_i < op->src_count; ++src_i) {
+            hash = hash_mix_u64(hash, (uint64_t)op->src[src_i]);
+        }
+        hash = hash_mix_u64(hash, (uint64_t)op->endian);
+        hash = hash_mix_u64(hash, op->imm);
+    }
+    for (i = 0; i < module->block_count; ++i) {
+        const xair_block_rec *block = &module->blocks[i];
+        const xair_value_id *true_args = term_args_const(module, &block->term, 0);
+        const xair_value_id *false_args = term_args_const(module, &block->term, 1);
+        size_t j;
+
+        hash = hash_mix_u64(hash, (uint64_t)i);
+        hash = hash_mix_u64(hash, (uint64_t)block->param_count);
+        for (j = 0; j < block->param_count; ++j) {
+            hash = hash_mix_u64(hash, (uint64_t)block->params[j]);
+        }
+        hash = hash_mix_u64(hash, (uint64_t)block->op_count);
+        for (j = 0; j < block->op_count; ++j) {
+            hash = hash_mix_u64(hash, (uint64_t)block->ops[j]);
+        }
+        hash = hash_mix_u64(hash, (uint64_t)block->term.kind);
+        hash = hash_mix_u64(hash, (uint64_t)block->term.condition);
+        hash = hash_mix_u64(hash, (uint64_t)block->term.true_target);
+        hash = hash_mix_u64(hash, (uint64_t)block->term.false_target);
+        hash = hash_mix_u64(hash, (uint64_t)block->term.true_arg_count);
+        for (j = 0; j < block->term.true_arg_count; ++j) {
+            hash = hash_mix_u64(hash, (uint64_t)true_args[j]);
+        }
+        hash = hash_mix_u64(hash, (uint64_t)block->term.false_arg_count);
+        for (j = 0; j < block->term.false_arg_count; ++j) {
+            hash = hash_mix_u64(hash, (uint64_t)false_args[j]);
+        }
+        hash = hash_mix_u64(hash, (uint64_t)block->term.code);
+    }
+    *out_hash = hash;
+    return XAIR_OK;
+}
+
 xair_status xair_ops_per_instruction(
     const xair_module *module,
     size_t machine_instruction_count,

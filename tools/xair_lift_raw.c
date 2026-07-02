@@ -74,7 +74,7 @@ static int read_file(const char *path, uint8_t **out_bytes, size_t *out_size) {
 }
 
 static void print_usage(const char *argv0) {
-    fprintf(stderr, "usage: %s <raw-binary> <base> <entry> [max-instructions]\n", argv0);
+    fprintf(stderr, "usage: %s [--json] <raw-binary> <base> <entry> [max-instructions]\n", argv0);
 }
 
 static int format_and_print_module(const xair_module *module) {
@@ -146,6 +146,58 @@ static void print_lift_result(const xair_lift_result *result) {
     printf("\n");
 }
 
+static void print_json_reg_values(const char *name, const xair_lift_reg_value *regs, size_t count) {
+    size_t i;
+
+    printf("  \"%s\": [", name);
+    for (i = 0; i < count; ++i) {
+        if (i != 0) {
+            printf(", ");
+        }
+        printf(
+            "{\"reg\":\"%s\",\"value\":%u}",
+            xair_x86_reg_name(regs[i].reg),
+            (unsigned)regs[i].value);
+    }
+    printf("],\n");
+}
+
+static void print_json_lift_result(const xair_module *module, const xair_lift_result *result) {
+    xair_module_metrics metrics;
+    uint64_t fingerprint = 0;
+
+    (void)xair_get_module_metrics(module, &metrics);
+    (void)xair_module_fingerprint(module, &fingerprint);
+    printf("{\n");
+    printf("  \"status\": \"ok\",\n");
+    printf("  \"verified\": true,\n");
+    printf("  \"ir_version\": \"%s\",\n", xair_ir_version_string());
+    printf("  \"arch\": \"x86_64\",\n");
+    printf("  \"decoder\": \"%s\",\n", result->decoder_name == NULL ? "unknown" : result->decoder_name);
+    printf("  \"end\": \"%s\",\n", xair_lift_end_kind_name(result->end_kind));
+    printf("  \"start\": %llu,\n", (unsigned long long)result->start);
+    printf("  \"next\": %llu,\n", (unsigned long long)result->next);
+    printf("  \"bytes\": %llu,\n", (unsigned long long)result->bytes_read);
+    printf("  \"instructions\": %llu,\n", (unsigned long long)result->instructions);
+    printf("  \"target\": %llu,\n", (unsigned long long)result->target);
+    printf("  \"fallthrough\": %llu,\n", (unsigned long long)result->fallthrough);
+    printf("  \"unsupported_address\": %llu,\n", (unsigned long long)result->unsupported_address);
+    printf("  \"unsupported_opcode\": %u,\n", (unsigned)result->unsupported_opcode);
+    printf("  \"memory_in\": %d,\n", result->memory_in == XAIR_INVALID_ID ? -1 : (int)result->memory_in);
+    printf("  \"memory_out\": %d,\n", result->memory_out == XAIR_INVALID_ID ? -1 : (int)result->memory_out);
+    printf("  \"branch_condition\": %d,\n", result->branch_condition == XAIR_INVALID_ID ? -1 : (int)result->branch_condition);
+    print_json_reg_values("input_regs", result->input_regs, result->input_reg_count);
+    print_json_reg_values("output_regs", result->output_regs, result->output_reg_count);
+    printf("  \"metrics\": {\"blocks\": %llu, \"values\": %llu, \"operations\": %llu, \"block_parameters\": %llu, \"terminator_arguments\": %llu},\n",
+        (unsigned long long)metrics.blocks,
+        (unsigned long long)metrics.values,
+        (unsigned long long)metrics.operations,
+        (unsigned long long)metrics.block_parameters,
+        (unsigned long long)metrics.terminator_arguments);
+    printf("  \"fingerprint\": \"0x%016llx\"\n", (unsigned long long)fingerprint);
+    printf("}\n");
+}
+
 int main(int argc, char **argv) {
     uint8_t *bytes = NULL;
     size_t size = 0;
@@ -159,17 +211,23 @@ int main(int argc, char **argv) {
     xair_module *module = NULL;
     xair_status status;
     int exit_code = 1;
+    int json = 0;
+    int argi = 1;
 
-    if (argc < 4 || argc > 5) {
+    if (argc > 1 && strcmp(argv[1], "--json") == 0) {
+        json = 1;
+        argi = 2;
+    }
+    if (argc - argi < 3 || argc - argi > 4) {
         print_usage(argv[0]);
         return 1;
     }
-    if (!parse_u64(argv[2], &base) || !parse_u64(argv[3], &entry) ||
-        (argc == 5 && !parse_size(argv[4], &max_instructions))) {
+    if (!parse_u64(argv[argi + 1], &base) || !parse_u64(argv[argi + 2], &entry) ||
+        (argc - argi == 4 && !parse_size(argv[argi + 3], &max_instructions))) {
         print_usage(argv[0]);
         return 1;
     }
-    if (!read_file(argv[1], &bytes, &size)) {
+    if (!read_file(argv[argi], &bytes, &size)) {
         fprintf(stderr, "failed to read input file\n");
         return 1;
     }
@@ -199,10 +257,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "verify failed: %s\n", error.message);
         goto done;
     }
-    print_lift_result(&result);
-    if (!format_and_print_module(module)) {
-        fprintf(stderr, "format failed\n");
-        goto done;
+    if (json) {
+        print_json_lift_result(module, &result);
+    } else {
+        print_lift_result(&result);
+        if (!format_and_print_module(module)) {
+            fprintf(stderr, "format failed\n");
+            goto done;
+        }
     }
     exit_code = 0;
 

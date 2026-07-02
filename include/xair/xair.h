@@ -269,6 +269,7 @@ xair_status xair_get_module_metrics(const xair_module *module, xair_module_metri
 xair_status xair_get_value_numbering_stats(
     const xair_module *module,
     xair_value_numbering_stats *out_stats);
+xair_status xair_module_fingerprint(const xair_module *module, uint64_t *out_hash);
 xair_status xair_ops_per_instruction(
     const xair_module *module,
     size_t machine_instruction_count,

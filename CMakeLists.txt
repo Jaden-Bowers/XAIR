@@ -47,3 +47,14 @@ add_executable(xair_lift_raw
 )
 
 target_link_libraries(xair_lift_raw PRIVATE xair)
+
+add_executable(xair_case_run
+    tools/xair_case_run.c
+)
+
+target_link_libraries(xair_case_run PRIVATE xair)
+
+add_test(
+    NAME xair_case_run_smoke
+    COMMAND xair_case_run ${CMAKE_CURRENT_SOURCE_DIR}/tests/cases/mov_ret.xaircase
+)

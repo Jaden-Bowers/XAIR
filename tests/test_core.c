@@ -25,6 +25,24 @@ static void test_ir_version_is_v0(void) {
     assert(xair_ir_version_u32() == 0x00000100u);
 }
 
+static void test_module_fingerprint_is_stable_and_structural(void) {
+    xair_module *module = NULL;
+    xair_block_id entry;
+    xair_value_id value;
+    uint64_t first;
+    uint64_t second;
+
+    require_ok(xair_module_create(&module));
+    require_ok(xair_block_create(module, "entry", &entry));
+    require_ok(xair_build_const_u64(module, entry, xair_type_i(64), 42, "value", &value));
+    require_ok(xair_set_return(module, entry, &value, 1));
+    require_ok(xair_module_fingerprint(module, &first));
+    require_ok(xair_module_fingerprint(module, &second));
+    assert(first != 0);
+    assert(first == second);
+    xair_module_destroy(module);
+}
+
 static void test_v0_golden_addr_and_flags_text(void) {
     static const char expected[] =
         "entry(%base:addr64, %delta:i64, %value:i64):\n"
@@ -789,6 +807,7 @@ static void test_vex_adapter_exit_continuation_carries_state(void) {
 
 int main(void) {
     test_ir_version_is_v0();
+    test_module_fingerprint_is_stable_and_structural();
     test_v0_golden_addr_and_flags_text();
     test_builder_freeze_makes_module_immutable();
     test_v0_verifier_rejects_bad_memory_token();

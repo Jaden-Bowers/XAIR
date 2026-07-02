@@ -52,6 +52,11 @@ The x86 lifter consumes a decoder backend interface. The current backend is the
 private `x86_stub` decoder, and future Zydis, XED, or generated-table decoders
 can be added without rewriting the lifter.
 
+For benchmark harnesses, XAIR exposes `xair_module_fingerprint`, JSON output
+from `xair_lift_raw --json`, and a small corpus runner named `xair_case_run`.
+The runner accepts key-value case files with raw bytes, base address, entry
+address, optional register inputs, and optional memory bytes.
+
 ## Build
 
 ```sh
@@ -64,6 +69,8 @@ ctest --test-dir build --output-on-failure
 
 ```sh
 build/Debug/xair_lift_raw.exe <raw-binary> <base> <entry> [max-instructions]
+build/Debug/xair_lift_raw.exe --json <raw-binary> <base> <entry> [max-instructions]
+build/Debug/xair_case_run.exe <case-file>
 ```
 
 This tool expects a raw byte blob, not a PE/ELF/Mach-O file. It prints lift
