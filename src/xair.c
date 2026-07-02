@@ -939,6 +939,31 @@ xair_status xair_block_add_param(
     return XAIR_OK;
 }
 
+size_t xair_block_param_count(const xair_module *module, xair_block_id block) {
+    if (module == NULL || !valid_block(module, block)) {
+        return 0;
+    }
+    return module->blocks[block].param_count;
+}
+
+xair_status xair_block_param_value(
+    const xair_module *module,
+    xair_block_id block,
+    size_t index,
+    xair_value_id *out_value) {
+    const xair_block_rec *bb;
+
+    if (module == NULL || out_value == NULL || !valid_block(module, block)) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    bb = &module->blocks[block];
+    if (index >= bb->param_count) {
+        return XAIR_ERR_RANGE;
+    }
+    *out_value = bb->params[index];
+    return XAIR_OK;
+}
+
 xair_status xair_build_const_u64(
     xair_module *module,
     xair_block_id block,

@@ -191,6 +191,13 @@ xair_status xair_block_add_param(
     const char *name,
     xair_value_id *out_value);
 
+size_t xair_block_param_count(const xair_module *module, xair_block_id block);
+xair_status xair_block_param_value(
+    const xair_module *module,
+    xair_block_id block,
+    size_t index,
+    xair_value_id *out_value);
+
 xair_status xair_build_const_u64(
     xair_module *module,
     xair_block_id block,
