@@ -38,9 +38,9 @@ typedef struct {
     xair_value_id condition;
     xair_block_id true_target;
     xair_block_id false_target;
-    xair_value_id *true_args;
+    size_t true_arg_offset;
     size_t true_arg_count;
-    xair_value_id *false_args;
+    size_t false_arg_offset;
     size_t false_arg_count;
     uint32_t code;
 } xair_term_rec;
@@ -66,6 +66,14 @@ struct xair_module {
     xair_block_rec *blocks;
     size_t block_count;
     size_t block_cap;
+    xair_value_id *term_args;
+    size_t term_arg_count;
+    size_t term_arg_cap;
+    int frozen;
+};
+
+struct xair_builder {
+    xair_module *module;
 };
 
 typedef struct {
@@ -117,34 +125,55 @@ static int valid_value(const xair_module *module, xair_value_id value) {
     return module != NULL && value < module->value_count;
 }
 
-static void clear_term(xair_term_rec *term) {
-    if (term == NULL) {
-        return;
+static const xair_value_id *term_args_const(
+    const xair_module *module,
+    const xair_term_rec *term,
+    int false_args) {
+    size_t count;
+    size_t offset;
+
+    if (module == NULL || term == NULL) {
+        return NULL;
     }
-    free(term->true_args);
-    free(term->false_args);
-    memset(term, 0, sizeof(*term));
-    term->condition = XAIR_INVALID_ID;
-    term->true_target = XAIR_INVALID_ID;
-    term->false_target = XAIR_INVALID_ID;
+    count = false_args ? term->false_arg_count : term->true_arg_count;
+    offset = false_args ? term->false_arg_offset : term->true_arg_offset;
+    if (count == 0) {
+        return NULL;
+    }
+    return module->term_args + offset;
 }
 
-static xair_status copy_args(const xair_value_id *args, size_t arg_count, xair_value_id **out_args) {
-    xair_value_id *copy;
+static xair_value_id *term_args_mut(xair_module *module, xair_term_rec *term, int false_args) {
+    return (xair_value_id *)term_args_const(module, term, false_args);
+}
 
-    *out_args = NULL;
+static xair_status append_term_args(
+    xair_module *module,
+    const xair_value_id *args,
+    size_t arg_count,
+    size_t *out_offset) {
+    xair_status status;
+
+    if (module == NULL || out_offset == NULL) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    *out_offset = module->term_arg_count;
     if (arg_count == 0) {
         return XAIR_OK;
     }
-    if (args == NULL || arg_count > SIZE_MAX / sizeof(*copy)) {
-        return args == NULL ? XAIR_ERR_BAD_ARG : XAIR_ERR_OOM;
+    if (args == NULL) {
+        return XAIR_ERR_BAD_ARG;
     }
-    copy = (xair_value_id *)malloc(arg_count * sizeof(*copy));
-    if (copy == NULL) {
-        return XAIR_ERR_OOM;
+    status = grow_array(
+        (void **)&module->term_args,
+        sizeof(*module->term_args),
+        &module->term_arg_cap,
+        module->term_arg_count + arg_count);
+    if (status != XAIR_OK) {
+        return status;
     }
-    memcpy(copy, args, arg_count * sizeof(*copy));
-    *out_args = copy;
+    memcpy(module->term_args + module->term_arg_count, args, arg_count * sizeof(*args));
+    module->term_arg_count += arg_count;
     return XAIR_OK;
 }
 
@@ -214,7 +243,8 @@ static xair_status add_value(
     xair_value_id id;
     xair_value_rec *value;
 
-    if (module == NULL || out_value == NULL || !valid_block(module, block) || !is_value_type(type)) {
+    if (module == NULL || out_value == NULL || module->frozen ||
+        !valid_block(module, block) || !is_value_type(type)) {
         return XAIR_ERR_BAD_ARG;
     }
     if (module->value_count >= UINT32_MAX) {
@@ -255,7 +285,8 @@ static xair_status add_op(
     xair_op_rec *op;
     xair_block_rec *block;
 
-    if (module == NULL || out_value == NULL || !valid_block(module, block_id) || src_count > 3) {
+    if (module == NULL || out_value == NULL || module->frozen ||
+        !valid_block(module, block_id) || src_count > 3) {
         return XAIR_ERR_BAD_ARG;
     }
     if (src_count != 0 && srcs == NULL) {
@@ -464,6 +495,60 @@ xair_status xair_module_create(xair_module **out_module) {
     return XAIR_OK;
 }
 
+xair_status xair_builder_create(xair_builder **out_builder) {
+    xair_builder *builder;
+    xair_status status;
+
+    if (out_builder == NULL) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    builder = (xair_builder *)calloc(1, sizeof(*builder));
+    if (builder == NULL) {
+        return XAIR_ERR_OOM;
+    }
+    status = xair_module_create(&builder->module);
+    if (status != XAIR_OK) {
+        free(builder);
+        return status;
+    }
+    *out_builder = builder;
+    return XAIR_OK;
+}
+
+void xair_builder_destroy(xair_builder *builder) {
+    if (builder == NULL) {
+        return;
+    }
+    xair_module_destroy(builder->module);
+    free(builder);
+}
+
+xair_module *xair_builder_module(xair_builder *builder) {
+    return builder == NULL ? NULL : builder->module;
+}
+
+xair_status xair_builder_freeze(xair_builder *builder, xair_module **out_module) {
+    if (builder == NULL || out_module == NULL || builder->module == NULL) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    builder->module->frozen = 1;
+    *out_module = builder->module;
+    builder->module = NULL;
+    return XAIR_OK;
+}
+
+xair_status xair_module_freeze(xair_module *module) {
+    if (module == NULL || module->frozen) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    module->frozen = 1;
+    return XAIR_OK;
+}
+
+int xair_module_is_frozen(const xair_module *module) {
+    return module != NULL && module->frozen;
+}
+
 void xair_module_destroy(xair_module *module) {
     size_t i;
 
@@ -473,8 +558,8 @@ void xair_module_destroy(xair_module *module) {
     for (i = 0; i < module->block_count; ++i) {
         free(module->blocks[i].params);
         free(module->blocks[i].ops);
-        clear_term(&module->blocks[i].term);
     }
+    free(module->term_args);
     free(module->blocks);
     free(module->ops);
     free(module->values);
@@ -498,7 +583,7 @@ xair_status xair_block_create(xair_module *module, const char *name, xair_block_
     xair_block_id id;
     xair_block_rec *block;
 
-    if (module == NULL || out_block == NULL) {
+    if (module == NULL || out_block == NULL || module->frozen) {
         return XAIR_ERR_BAD_ARG;
     }
     if (module->block_count >= UINT32_MAX) {
@@ -639,9 +724,9 @@ xair_status xair_build_store(
     return add_op(module, block, XAIR_OP_STORE, module->values[memory].type, srcs, 3, 0, endian, name, out_memory);
 }
 
-static xair_status set_term(xair_module *module, xair_block_id block, xair_term_rec *term) {
-    if (!valid_block(module, block) || term == NULL || module->blocks[block].term.kind != XAIR_TERM_NONE) {
-        clear_term(term);
+static xair_status set_term(xair_module *module, xair_block_id block, const xair_term_rec *term) {
+    if (module == NULL || module->frozen || !valid_block(module, block) ||
+        term == NULL || module->blocks[block].term.kind != XAIR_TERM_NONE) {
         return XAIR_ERR_BAD_ARG;
     }
     module->blocks[block].term = *term;
@@ -657,7 +742,8 @@ xair_status xair_set_jump(
     xair_term_rec term;
     xair_status status;
 
-    if (!valid_block(module, target)) {
+    if (module == NULL || module->frozen || !valid_block(module, block) ||
+        module->blocks[block].term.kind != XAIR_TERM_NONE || !valid_block(module, target)) {
         return XAIR_ERR_BAD_ARG;
     }
     memset(&term, 0, sizeof(term));
@@ -665,7 +751,7 @@ xair_status xair_set_jump(
     term.condition = XAIR_INVALID_ID;
     term.true_target = target;
     term.false_target = XAIR_INVALID_ID;
-    status = copy_args(args, arg_count, &term.true_args);
+    status = append_term_args(module, args, arg_count, &term.true_arg_offset);
     if (status != XAIR_OK) {
         return status;
     }
@@ -686,7 +772,10 @@ xair_status xair_set_cbranch(
     xair_term_rec term;
     xair_status status;
 
-    if (!valid_value(module, condition) || !valid_block(module, true_target) || !valid_block(module, false_target)) {
+    if (module == NULL || module->frozen || !valid_block(module, block) ||
+        module->blocks[block].term.kind != XAIR_TERM_NONE ||
+        !valid_value(module, condition) || !valid_block(module, true_target) ||
+        !valid_block(module, false_target)) {
         return XAIR_ERR_BAD_ARG;
     }
     memset(&term, 0, sizeof(term));
@@ -694,14 +783,13 @@ xair_status xair_set_cbranch(
     term.condition = condition;
     term.true_target = true_target;
     term.false_target = false_target;
-    status = copy_args(true_args, true_arg_count, &term.true_args);
+    status = append_term_args(module, true_args, true_arg_count, &term.true_arg_offset);
     if (status != XAIR_OK) {
         return status;
     }
     term.true_arg_count = true_arg_count;
-    status = copy_args(false_args, false_arg_count, &term.false_args);
+    status = append_term_args(module, false_args, false_arg_count, &term.false_arg_offset);
     if (status != XAIR_OK) {
-        clear_term(&term);
         return status;
     }
     term.false_arg_count = false_arg_count;
@@ -716,12 +804,16 @@ xair_status xair_set_return(
     xair_term_rec term;
     xair_status status;
 
+    if (module == NULL || module->frozen || !valid_block(module, block) ||
+        module->blocks[block].term.kind != XAIR_TERM_NONE) {
+        return XAIR_ERR_BAD_ARG;
+    }
     memset(&term, 0, sizeof(term));
     term.kind = XAIR_TERM_RETURN;
     term.condition = XAIR_INVALID_ID;
     term.true_target = XAIR_INVALID_ID;
     term.false_target = XAIR_INVALID_ID;
-    status = copy_args(values, value_count, &term.true_args);
+    status = append_term_args(module, values, value_count, &term.true_arg_offset);
     if (status != XAIR_OK) {
         return status;
     }
@@ -731,6 +823,10 @@ xair_status xair_set_return(
 
 xair_status xair_set_trap(xair_module *module, xair_block_id block, uint32_t code) {
     xair_term_rec term;
+    if (module == NULL || module->frozen || !valid_block(module, block) ||
+        module->blocks[block].term.kind != XAIR_TERM_NONE) {
+        return XAIR_ERR_BAD_ARG;
+    }
     memset(&term, 0, sizeof(term));
     term.kind = XAIR_TERM_TRAP;
     term.condition = XAIR_INVALID_ID;
@@ -742,6 +838,10 @@ xair_status xair_set_trap(xair_module *module, xair_block_id block, uint32_t cod
 
 xair_status xair_set_fault(xair_module *module, xair_block_id block, uint32_t code) {
     xair_term_rec term;
+    if (module == NULL || module->frozen || !valid_block(module, block) ||
+        module->blocks[block].term.kind != XAIR_TERM_NONE) {
+        return XAIR_ERR_BAD_ARG;
+    }
     memset(&term, 0, sizeof(term));
     term.kind = XAIR_TERM_FAULT;
     term.condition = XAIR_INVALID_ID;
@@ -981,20 +1081,41 @@ static xair_status verify_term(
     case XAIR_TERM_NONE:
         return set_error(error, block_id, XAIR_INVALID_ID, "block has no terminator");
     case XAIR_TERM_JUMP:
-        return verify_target_args(module, block_id, available, block->term.true_target, block->term.true_args, block->term.true_arg_count, error);
+        return verify_target_args(
+            module,
+            block_id,
+            available,
+            block->term.true_target,
+            term_args_const(module, &block->term, 0),
+            block->term.true_arg_count,
+            error);
     case XAIR_TERM_CBRANCH:
         if (!valid_value(module, block->term.condition) ||
             !available[block->term.condition] ||
             !is_i1(module->values[block->term.condition].type)) {
             return set_error(error, block_id, block->term.condition, "conditional branch requires available i1 condition");
         }
-        if (verify_target_args(module, block_id, available, block->term.true_target, block->term.true_args, block->term.true_arg_count, error) != XAIR_OK) {
+        if (verify_target_args(
+            module,
+            block_id,
+            available,
+            block->term.true_target,
+            term_args_const(module, &block->term, 0),
+            block->term.true_arg_count,
+            error) != XAIR_OK) {
             return XAIR_ERR_VERIFY;
         }
-        return verify_target_args(module, block_id, available, block->term.false_target, block->term.false_args, block->term.false_arg_count, error);
+        return verify_target_args(
+            module,
+            block_id,
+            available,
+            block->term.false_target,
+            term_args_const(module, &block->term, 1),
+            block->term.false_arg_count,
+            error);
     case XAIR_TERM_RETURN:
         for (i = 0; i < block->term.true_arg_count; ++i) {
-            xair_value_id value = block->term.true_args[i];
+            xair_value_id value = term_args_const(module, &block->term, 0)[i];
             if (!valid_value(module, value) || !available[value]) {
                 return set_error(error, block_id, value, "return value is not available in source block");
             }
@@ -1507,21 +1628,23 @@ static void mark_live_value(const xair_module *module, unsigned char *live, xair
 
 static void mark_term_live_values(const xair_module *module, const xair_block_rec *block, unsigned char *live) {
     size_t i;
+    const xair_value_id *true_args = term_args_const(module, &block->term, 0);
+    const xair_value_id *false_args = term_args_const(module, &block->term, 1);
 
     switch (block->term.kind) {
     case XAIR_TERM_JUMP:
     case XAIR_TERM_RETURN:
         for (i = 0; i < block->term.true_arg_count; ++i) {
-            mark_live_value(module, live, block->term.true_args[i]);
+            mark_live_value(module, live, true_args[i]);
         }
         break;
     case XAIR_TERM_CBRANCH:
         mark_live_value(module, live, block->term.condition);
         for (i = 0; i < block->term.true_arg_count; ++i) {
-            mark_live_value(module, live, block->term.true_args[i]);
+            mark_live_value(module, live, true_args[i]);
         }
         for (i = 0; i < block->term.false_arg_count; ++i) {
-            mark_live_value(module, live, block->term.false_args[i]);
+            mark_live_value(module, live, false_args[i]);
         }
         break;
     default:
@@ -1632,12 +1755,12 @@ static xair_status compact_live_values(
         switch (block->term.kind) {
         case XAIR_TERM_JUMP:
         case XAIR_TERM_RETURN:
-            remap_args(value_map, block->term.true_args, block->term.true_arg_count);
+            remap_args(value_map, term_args_mut(module, &block->term, 0), block->term.true_arg_count);
             break;
         case XAIR_TERM_CBRANCH:
             block->term.condition = value_map[block->term.condition];
-            remap_args(value_map, block->term.true_args, block->term.true_arg_count);
-            remap_args(value_map, block->term.false_args, block->term.false_arg_count);
+            remap_args(value_map, term_args_mut(module, &block->term, 0), block->term.true_arg_count);
+            remap_args(value_map, term_args_mut(module, &block->term, 1), block->term.false_arg_count);
             break;
         default:
             break;
@@ -1692,7 +1815,7 @@ xair_status xair_canonicalize_module(
     xair_canonicalize_stats stats;
     xair_status status;
 
-    if (module == NULL) {
+    if (module == NULL || module->frozen) {
         return XAIR_ERR_BAD_ARG;
     }
     memset(&stats, 0, sizeof(stats));
@@ -1839,7 +1962,7 @@ static void print_term(const xair_module *module, xair_printer *printer, const x
     case XAIR_TERM_JUMP:
         print_append(printer, "  jump ");
         print_block_ref(module, printer, block->term.true_target);
-        print_args(module, printer, block->term.true_args, block->term.true_arg_count);
+        print_args(module, printer, term_args_const(module, &block->term, 0), block->term.true_arg_count);
         print_append(printer, "\n");
         break;
     case XAIR_TERM_CBRANCH:
@@ -1847,17 +1970,17 @@ static void print_term(const xair_module *module, xair_printer *printer, const x
         print_value_ref(module, printer, block->term.condition);
         print_append(printer, ", ");
         print_block_ref(module, printer, block->term.true_target);
-        print_args(module, printer, block->term.true_args, block->term.true_arg_count);
+        print_args(module, printer, term_args_const(module, &block->term, 0), block->term.true_arg_count);
         print_append(printer, ", ");
         print_block_ref(module, printer, block->term.false_target);
-        print_args(module, printer, block->term.false_args, block->term.false_arg_count);
+        print_args(module, printer, term_args_const(module, &block->term, 1), block->term.false_arg_count);
         print_append(printer, "\n");
         break;
     case XAIR_TERM_RETURN:
         print_append(printer, "  return");
         if (block->term.true_arg_count != 0) {
             print_append(printer, " ");
-            print_args(module, printer, block->term.true_args, block->term.true_arg_count);
+            print_args(module, printer, term_args_const(module, &block->term, 0), block->term.true_arg_count);
         }
         print_append(printer, "\n");
         break;
@@ -2639,7 +2762,7 @@ xair_status xair_exec_run(
             status = exec_transfer_args(
                 state,
                 block->term.true_target,
-                block->term.true_args,
+                term_args_const(module, &block->term, 0),
                 block->term.true_arg_count);
             if (status != XAIR_OK) {
                 return status;
@@ -2661,7 +2784,7 @@ xair_status xair_exec_run(
             status = exec_transfer_args(
                 state,
                 take_true ? block->term.true_target : block->term.false_target,
-                take_true ? block->term.true_args : block->term.false_args,
+                term_args_const(module, &block->term, take_true ? 0 : 1),
                 take_true ? block->term.true_arg_count : block->term.false_arg_count);
             if (status != XAIR_OK) {
                 return status;
@@ -2676,7 +2799,10 @@ xair_status xair_exec_run(
             exec_set_result(out_result, XAIR_EXEC_HALTED_RETURN, current, 0);
             out_result->return_count = block->term.true_arg_count;
             for (i = 0; i < block->term.true_arg_count; ++i) {
-                status = exec_read_value(state, block->term.true_args[i], &out_result->returns[i]);
+                status = exec_read_value(
+                    state,
+                    term_args_const(module, &block->term, 0)[i],
+                    &out_result->returns[i]);
                 if (status != XAIR_OK) {
                     return status;
                 }

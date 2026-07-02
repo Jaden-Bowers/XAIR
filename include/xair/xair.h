@@ -111,6 +111,7 @@ typedef struct {
 } xair_canonicalize_stats;
 
 typedef struct xair_module xair_module;
+typedef struct xair_builder xair_builder;
 typedef struct xair_exec_state xair_exec_state;
 
 #define XAIR_EXEC_MAX_RETURNS 8
@@ -154,6 +155,13 @@ uint32_t xair_ir_version_u32(void);
 
 xair_status xair_module_create(xair_module **out_module);
 void xair_module_destroy(xair_module *module);
+xair_status xair_module_freeze(xair_module *module);
+int xair_module_is_frozen(const xair_module *module);
+
+xair_status xair_builder_create(xair_builder **out_builder);
+void xair_builder_destroy(xair_builder *builder);
+xair_module *xair_builder_module(xair_builder *builder);
+xair_status xair_builder_freeze(xair_builder *builder, xair_module **out_module);
 
 size_t xair_module_block_count(const xair_module *module);
 size_t xair_module_value_count(const xair_module *module);

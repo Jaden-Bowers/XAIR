@@ -63,6 +63,41 @@ static void test_v0_golden_addr_and_flags_text(void) {
     xair_module_destroy(module);
 }
 
+static void test_builder_freeze_makes_module_immutable(void) {
+    xair_builder *builder = NULL;
+    xair_module *module;
+    xair_module *frozen = NULL;
+    xair_error error;
+    xair_canonicalize_stats stats;
+    xair_block_id entry;
+    xair_block_id extra;
+    xair_value_id value;
+    xair_value_id rejected;
+    char text[512];
+
+    require_ok(xair_builder_create(&builder));
+    module = xair_builder_module(builder);
+    assert(module != NULL);
+    assert(!xair_module_is_frozen(module));
+    require_ok(xair_block_create(module, "entry", &entry));
+    require_ok(xair_build_const_u64(module, entry, xair_type_i(64), 7, "value", &value));
+    require_ok(xair_set_return(module, entry, &value, 1));
+    require_ok(xair_builder_freeze(builder, &frozen));
+    assert(frozen == module);
+    assert(xair_builder_module(builder) == NULL);
+    assert(xair_module_is_frozen(frozen));
+
+    require_ok(xair_verify_module(frozen, &error));
+    require_ok(xair_format_module(frozen, text, sizeof(text)));
+    assert(strstr(text, "return (%value)") != NULL);
+    assert(xair_block_create(frozen, "extra", &extra) == XAIR_ERR_BAD_ARG);
+    assert(xair_build_const_u64(frozen, entry, xair_type_i(64), 9, "rejected", &rejected) == XAIR_ERR_BAD_ARG);
+    assert(xair_canonicalize_module(frozen, &stats, &error) == XAIR_ERR_BAD_ARG);
+
+    xair_builder_destroy(builder);
+    xair_module_destroy(frozen);
+}
+
 static void test_v0_verifier_rejects_bad_memory_token(void) {
     xair_module *module = NULL;
     xair_error error;
@@ -624,6 +659,7 @@ static void test_vex_adapter_exit_continuation_carries_state(void) {
 int main(void) {
     test_ir_version_is_v0();
     test_v0_golden_addr_and_flags_text();
+    test_builder_freeze_makes_module_immutable();
     test_v0_verifier_rejects_bad_memory_token();
     test_v0_verifier_rejects_bad_branch_condition();
     test_v0_verifier_rejects_bad_flag_extract();

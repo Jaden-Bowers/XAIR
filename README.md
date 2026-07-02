@@ -25,10 +25,14 @@ This repository is the IR generator side of the project. CFG recovery,
 symbolic execution, taint propagation, and benchmark orchestration are separate
 layers that should consume this IR rather than being mixed into the frontend.
 
-The current module builder is still a mutable bootstrap implementation. The
-next core-IR work should freeze an immutable module format, add arena/slab
-allocation, and introduce structural value numbering before expanding symbolic
-or taint backends.
+The current construction path is still a mutable bootstrap implementation, but
+it now has an explicit freeze boundary. The remaining core-IR work is to move
+more variable-length data into arenas or slabs and keep improving structural
+value numbering before expanding symbolic or taint backends.
+
+New code can build through `xair_builder`, then freeze the result with
+`xair_builder_freeze` or `xair_module_freeze`. Frozen modules reject mutation
+and are intended for verification, formatting, execution, and benchmarking.
 
 Address arithmetic is intentionally explicit: integer `add`/`sub` are not valid
 for address values. Address updates must use `addr_add`, `addr_sub`,
