@@ -19,6 +19,7 @@ Implemented pieces:
 - VEX-shaped adapter layer.
 - Raw x86-64 basic-block lifter for a benchmark-oriented instruction subset.
 - `xair_lift_raw` tool for lifting raw byte blobs into XAIR text.
+- `xair_bench_lift` tool for in-process lift timing over benchmark cases.
 
 ## Design Boundary
 
@@ -77,12 +78,21 @@ cmake -S . -B build-strict -DXAIR_STRICT_WARNINGS=ON
 cmake --build build-strict
 ```
 
+For optimized WSL benchmarks:
+
+```sh
+cmake -S . -B build-wsl-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DXAIR_STRICT_WARNINGS=ON
+cmake --build build-wsl-release
+ctest --test-dir build-wsl-release --output-on-failure
+```
+
 ## Raw Lift Tool
 
 ```sh
 build/Debug/xair_lift_raw.exe <raw-binary> <base> <entry> [max-instructions]
 build/Debug/xair_lift_raw.exe --json <raw-binary> <base> <entry> [max-instructions]
 build/Debug/xair_case_run.exe <case-file>
+build/Debug/xair_bench_lift.exe --repeat 1000 --warmup 100 <case-file>...
 ```
 
 This tool expects a raw byte blob, not a PE/ELF/Mach-O file. It prints lift
@@ -92,6 +102,11 @@ for a later separate project that consumes this frontend.
 The frontend reports block input registers, output registers, memory tokens,
 branch metadata, and generated XAIR so lift speed and IR inflation can be
 benchmarked separately from CFG recovery.
+
+`xair_bench_lift` is the preferred timing path. It keeps the process alive,
+loads benchmark cases once, repeats lifting in a tight loop, and reports JSONL
+rows with lift, canonicalize, freeze, fingerprint, value-numbering, and final
+module metrics.
 
 ## Attribution
 

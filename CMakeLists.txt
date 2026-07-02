@@ -23,6 +23,14 @@ function(xair_apply_warnings target)
     endif()
 endfunction()
 
+function(xair_keep_asserts target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(${target} PRIVATE -UNDEBUG)
+    endif()
+endfunction()
+
 add_library(xair STATIC
     src/xair.c
     src/xair_frontend.c
@@ -45,6 +53,7 @@ add_executable(xair_core_tests
 
 target_link_libraries(xair_core_tests PRIVATE xair)
 xair_apply_warnings(xair_core_tests)
+xair_keep_asserts(xair_core_tests)
 
 add_test(NAME xair_core_tests COMMAND xair_core_tests)
 
@@ -54,6 +63,7 @@ add_executable(xair_frontend_tests
 
 target_link_libraries(xair_frontend_tests PRIVATE xair)
 xair_apply_warnings(xair_frontend_tests)
+xair_keep_asserts(xair_frontend_tests)
 
 add_test(NAME xair_frontend_tests COMMAND xair_frontend_tests)
 
@@ -70,6 +80,13 @@ add_executable(xair_case_run
 
 target_link_libraries(xair_case_run PRIVATE xair)
 xair_apply_warnings(xair_case_run)
+
+add_executable(xair_bench_lift
+    tools/xair_bench_lift.c
+)
+
+target_link_libraries(xair_bench_lift PRIVATE xair)
+xair_apply_warnings(xair_bench_lift)
 
 add_test(
     NAME xair_case_run_smoke

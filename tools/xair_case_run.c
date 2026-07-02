@@ -237,7 +237,7 @@ static int parse_case_line(case_config *config, char *line) {
 
 static int read_case_file(const char *path, case_config *config) {
     FILE *file;
-    char line[512];
+    char line[8192];
 
     file = fopen(path, "r");
     if (file == NULL) {
