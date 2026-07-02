@@ -76,10 +76,13 @@ typedef enum {
     XAIR_OP_FLAGS_ADD,
     XAIR_OP_FLAGS_SUB,
     XAIR_OP_FLAGS_LOGIC,
+    XAIR_OP_FLAGS_SHL,
     XAIR_OP_FLAG_ZF,
     XAIR_OP_FLAG_CF,
     XAIR_OP_FLAG_OF,
     XAIR_OP_FLAG_SF,
+    XAIR_OP_FLAG_PF,
+    XAIR_OP_FLAG_AF,
     XAIR_OP_LOAD,
     XAIR_OP_STORE
 } xair_opcode;

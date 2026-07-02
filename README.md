@@ -45,6 +45,9 @@ Construction performs local structural value numbering for equivalent constants,
 unary nodes, binary nodes, loads, and stores. This keeps repeated expressions
 from inflating the IR before canonicalization runs.
 
+Lazy flags cover add, sub, logic, and shift-left summaries, with extractors for
+ZF, CF, OF, SF, PF, and AF.
+
 ## Build
 
 ```sh

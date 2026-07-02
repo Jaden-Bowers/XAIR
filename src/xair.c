@@ -662,10 +662,13 @@ const char *xair_opcode_name(xair_opcode opcode) {
     case XAIR_OP_FLAGS_ADD: return "flags_add";
     case XAIR_OP_FLAGS_SUB: return "flags_sub";
     case XAIR_OP_FLAGS_LOGIC: return "flags_logic";
+    case XAIR_OP_FLAGS_SHL: return "flags_shl";
     case XAIR_OP_FLAG_ZF: return "flag_zf";
     case XAIR_OP_FLAG_CF: return "flag_cf";
     case XAIR_OP_FLAG_OF: return "flag_of";
     case XAIR_OP_FLAG_SF: return "flag_sf";
+    case XAIR_OP_FLAG_PF: return "flag_pf";
+    case XAIR_OP_FLAG_AF: return "flag_af";
     case XAIR_OP_LOAD: return "load";
     case XAIR_OP_STORE: return "store";
     default: return "unknown";
@@ -1112,6 +1115,7 @@ static xair_status verify_binary_op(const xair_module *module, const xair_op_rec
         return XAIR_OK;
     case XAIR_OP_FLAGS_ADD:
     case XAIR_OP_FLAGS_SUB:
+    case XAIR_OP_FLAGS_SHL:
         if (!xair_type_equal(lhs, rhs) || !is_int(lhs) || !is_flags(out)) {
             return set_error(error, block, op->dst, "%s requires matching integer operands and flags result", xair_opcode_name(op->opcode));
         }
@@ -1156,6 +1160,8 @@ static xair_status verify_unary_op(const xair_module *module, const xair_op_rec 
     case XAIR_OP_FLAG_CF:
     case XAIR_OP_FLAG_OF:
     case XAIR_OP_FLAG_SF:
+    case XAIR_OP_FLAG_PF:
+    case XAIR_OP_FLAG_AF:
         if (!is_flags(src) || !is_i1(out)) {
             return set_error(error, block, op->dst, "%s requires flags input and i1 result", xair_opcode_name(op->opcode));
         }
@@ -1218,6 +1224,8 @@ static xair_status verify_op(const xair_module *module, const xair_op_rec *op, x
     case XAIR_OP_FLAG_CF:
     case XAIR_OP_FLAG_OF:
     case XAIR_OP_FLAG_SF:
+    case XAIR_OP_FLAG_PF:
+    case XAIR_OP_FLAG_AF:
         if (op->src_count != 1) {
             return set_error(error, block, op->dst, "unary operation has wrong source count");
         }
@@ -1504,6 +1512,13 @@ static int signed_less_u64(uint64_t lhs, uint64_t rhs, uint16_t bits) {
     return lhs < rhs;
 }
 
+static int even_parity8(uint64_t value) {
+    uint8_t byte = (uint8_t)(value & 0xffu);
+    byte ^= (uint8_t)(byte >> 4u);
+    byte &= 0x0fu;
+    return ((0x6996u >> byte) & 1u) == 0;
+}
+
 static void fold_to_const(xair_op_rec *op, uint64_t value, xair_type type) {
     op->opcode = XAIR_OP_CONST_U64;
     op->src_count = 0;
@@ -1542,7 +1557,8 @@ static int compute_flag_extract(
     flags_op = &module->ops[flags_op_id];
     if (flags_op->opcode != XAIR_OP_FLAGS_ADD &&
         flags_op->opcode != XAIR_OP_FLAGS_SUB &&
-        flags_op->opcode != XAIR_OP_FLAGS_LOGIC) {
+        flags_op->opcode != XAIR_OP_FLAGS_LOGIC &&
+        flags_op->opcode != XAIR_OP_FLAGS_SHL) {
         return 0;
     }
     if (!const_u64_value(module, flags_op->src[0], &lhs)) {
@@ -1567,6 +1583,11 @@ static int compute_flag_extract(
         result = (lhs + rhs) & mask;
     } else if (flags_op->opcode == XAIR_OP_FLAGS_SUB) {
         result = (lhs - rhs) & mask;
+    } else if (flags_op->opcode == XAIR_OP_FLAGS_SHL) {
+        if (rhs == 0 || rhs >= bits) {
+            return 0;
+        }
+        result = (lhs << rhs) & mask;
     } else {
         result = lhs;
     }
@@ -1582,6 +1603,8 @@ static int compute_flag_extract(
     case XAIR_OP_FLAG_CF:
         if (flags_op->opcode == XAIR_OP_FLAGS_LOGIC) {
             *out_value = 0;
+        } else if (flags_op->opcode == XAIR_OP_FLAGS_SHL) {
+            *out_value = (lhs >> (bits - rhs)) & 1u;
         } else {
             *out_value = flags_op->opcode == XAIR_OP_FLAGS_ADD ? result < lhs : lhs < rhs;
         }
@@ -1589,6 +1612,11 @@ static int compute_flag_extract(
     case XAIR_OP_FLAG_OF:
         if (flags_op->opcode == XAIR_OP_FLAGS_LOGIC) {
             *out_value = 0;
+        } else if (flags_op->opcode == XAIR_OP_FLAGS_SHL) {
+            if (rhs != 1) {
+                return 0;
+            }
+            *out_value = result_sign != (((lhs >> (bits - rhs)) & 1u) != 0);
         } else if (flags_op->opcode == XAIR_OP_FLAGS_ADD) {
             *out_value = (lhs_sign == rhs_sign) && (result_sign != lhs_sign);
         } else {
@@ -1597,6 +1625,16 @@ static int compute_flag_extract(
         return 1;
     case XAIR_OP_FLAG_SF:
         *out_value = result_sign;
+        return 1;
+    case XAIR_OP_FLAG_PF:
+        *out_value = even_parity8(result);
+        return 1;
+    case XAIR_OP_FLAG_AF:
+        if (flags_op->opcode == XAIR_OP_FLAGS_LOGIC || flags_op->opcode == XAIR_OP_FLAGS_SHL) {
+            *out_value = 0;
+        } else {
+            *out_value = ((lhs ^ rhs ^ result) & 0x10u) != 0;
+        }
         return 1;
     default:
         return 0;
@@ -1737,6 +1775,8 @@ static int fold_constant_op(xair_module *module, xair_op_rec *op) {
     case XAIR_OP_FLAG_CF:
     case XAIR_OP_FLAG_OF:
     case XAIR_OP_FLAG_SF:
+    case XAIR_OP_FLAG_PF:
+    case XAIR_OP_FLAG_AF:
         if (!compute_flag_extract(module, op->opcode, op->src[0], &folded)) {
             return 0;
         }
@@ -2256,6 +2296,8 @@ xair_status xair_format_module(const xair_module *module, char *buffer, size_t b
 #define XAIR_EXEC_FLAG_CF UINT64_C(2)
 #define XAIR_EXEC_FLAG_OF UINT64_C(4)
 #define XAIR_EXEC_FLAG_SF UINT64_C(8)
+#define XAIR_EXEC_FLAG_PF UINT64_C(16)
+#define XAIR_EXEC_FLAG_AF UINT64_C(32)
 
 typedef struct {
     uint16_t space;
@@ -2589,6 +2631,9 @@ static uint64_t exec_logic_flags(uint64_t result, uint16_t bits) {
     if ((result & sign_bit_for_bits(bits)) != 0) {
         packed |= XAIR_EXEC_FLAG_SF;
     }
+    if (even_parity8(result)) {
+        packed |= XAIR_EXEC_FLAG_PF;
+    }
     return packed;
 }
 
@@ -2623,6 +2668,39 @@ static uint64_t exec_flags(xair_opcode opcode, uint64_t lhs, uint64_t rhs, uint1
     }
     if (result_sign) {
         packed |= XAIR_EXEC_FLAG_SF;
+    }
+    if (even_parity8(result)) {
+        packed |= XAIR_EXEC_FLAG_PF;
+    }
+    if (((lhs ^ rhs ^ result) & 0x10u) != 0) {
+        packed |= XAIR_EXEC_FLAG_AF;
+    }
+    return packed;
+}
+
+static uint64_t exec_shift_left_flags(uint64_t lhs, uint64_t shift, uint16_t bits) {
+    uint64_t mask = mask_for_bits(bits);
+    uint64_t result;
+    uint64_t cf;
+    uint64_t packed = 0;
+
+    lhs &= mask;
+    result = (lhs << shift) & mask;
+    cf = (lhs >> (bits - shift)) & 1u;
+    if (result == 0) {
+        packed |= XAIR_EXEC_FLAG_ZF;
+    }
+    if ((result & sign_bit_for_bits(bits)) != 0) {
+        packed |= XAIR_EXEC_FLAG_SF;
+    }
+    if (even_parity8(result)) {
+        packed |= XAIR_EXEC_FLAG_PF;
+    }
+    if (cf) {
+        packed |= XAIR_EXEC_FLAG_CF;
+    }
+    if (shift == 1 && (((result & sign_bit_for_bits(bits)) != 0) != (cf != 0))) {
+        packed |= XAIR_EXEC_FLAG_OF;
     }
     return packed;
 }
@@ -2729,6 +2807,14 @@ static xair_status exec_binary_op(
             state,
             op->dst,
             exec_value_make(out, exec_flags(op->opcode, lhs.lo, rhs.lo, lhs.type.bits), 0));
+    case XAIR_OP_FLAGS_SHL:
+        if (!is_int(lhs.type) || !is_int(rhs.type) || rhs.lo == 0 || rhs.lo >= lhs.type.bits) {
+            return XAIR_ERR_UNSUPPORTED;
+        }
+        return exec_define_value(
+            state,
+            op->dst,
+            exec_value_make(out, exec_shift_left_flags(lhs.lo, rhs.lo, lhs.type.bits), 0));
     default:
         return XAIR_ERR_UNSUPPORTED;
     }
@@ -2783,6 +2869,14 @@ static xair_status exec_unary_op(
         break;
     case XAIR_OP_FLAG_SF:
         flag = XAIR_EXEC_FLAG_SF;
+        result = (src.lo & flag) != 0;
+        break;
+    case XAIR_OP_FLAG_PF:
+        flag = XAIR_EXEC_FLAG_PF;
+        result = (src.lo & flag) != 0;
+        break;
+    case XAIR_OP_FLAG_AF:
+        flag = XAIR_EXEC_FLAG_AF;
         result = (src.lo & flag) != 0;
         break;
     default:

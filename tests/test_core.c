@@ -487,6 +487,76 @@ static void test_canonicalize_folds_logic_flag_extracts(void) {
     xair_module_destroy(module);
 }
 
+static void test_lazy_shift_flags_and_extra_extracts_execute(void) {
+    xair_module *module = NULL;
+    xair_exec_state *state = NULL;
+    xair_exec_result result;
+    xair_error error;
+    xair_canonicalize_stats stats;
+    xair_block_id entry;
+    xair_value_id lhs;
+    xair_value_id shift;
+    xair_value_id add_lhs;
+    xair_value_id add_rhs;
+    xair_value_id shift_flags;
+    xair_value_id add_flags;
+    xair_value_id zf;
+    xair_value_id cf;
+    xair_value_id of;
+    xair_value_id sf;
+    xair_value_id pf;
+    xair_value_id shl_af;
+    xair_value_id add_af;
+    xair_value_id returns[7];
+
+    require_ok(xair_module_create(&module));
+    require_ok(xair_block_create(module, "entry", &entry));
+    require_ok(xair_build_const_u64(module, entry, xair_type_i(8), 0x80, "lhs", &lhs));
+    require_ok(xair_build_const_u64(module, entry, xair_type_i(8), 1, "shift", &shift));
+    require_ok(xair_build_const_u64(module, entry, xair_type_i(8), 0x0f, "add_lhs", &add_lhs));
+    require_ok(xair_build_const_u64(module, entry, xair_type_i(8), 1, "add_rhs", &add_rhs));
+    require_ok(xair_build_binary(module, entry, XAIR_OP_FLAGS_SHL, xair_type_flags(6), lhs, shift, "shift_flags", &shift_flags));
+    require_ok(xair_build_binary(module, entry, XAIR_OP_FLAGS_ADD, xair_type_flags(6), add_lhs, add_rhs, "add_flags", &add_flags));
+    require_ok(xair_build_unary(module, entry, XAIR_OP_FLAG_ZF, xair_type_i(1), shift_flags, "zf", &zf));
+    require_ok(xair_build_unary(module, entry, XAIR_OP_FLAG_CF, xair_type_i(1), shift_flags, "cf", &cf));
+    require_ok(xair_build_unary(module, entry, XAIR_OP_FLAG_OF, xair_type_i(1), shift_flags, "of", &of));
+    require_ok(xair_build_unary(module, entry, XAIR_OP_FLAG_SF, xair_type_i(1), shift_flags, "sf", &sf));
+    require_ok(xair_build_unary(module, entry, XAIR_OP_FLAG_PF, xair_type_i(1), shift_flags, "pf", &pf));
+    require_ok(xair_build_unary(module, entry, XAIR_OP_FLAG_AF, xair_type_i(1), shift_flags, "shl_af", &shl_af));
+    require_ok(xair_build_unary(module, entry, XAIR_OP_FLAG_AF, xair_type_i(1), add_flags, "add_af", &add_af));
+    returns[0] = zf;
+    returns[1] = cf;
+    returns[2] = of;
+    returns[3] = sf;
+    returns[4] = pf;
+    returns[5] = shl_af;
+    returns[6] = add_af;
+    require_ok(xair_set_return(module, entry, returns, 7));
+    require_ok(xair_verify_module(module, &error));
+
+    require_ok(xair_exec_state_create(module, &state));
+    require_ok(xair_exec_run(module, entry, state, 32, &result));
+    assert(result.kind == XAIR_EXEC_HALTED_RETURN);
+    assert(result.return_count == 7);
+    assert(result.returns[0].lo == 1);
+    assert(result.returns[1].lo == 1);
+    assert(result.returns[2].lo == 1);
+    assert(result.returns[3].lo == 0);
+    assert(result.returns[4].lo == 1);
+    assert(result.returns[5].lo == 0);
+    assert(result.returns[6].lo == 1);
+    xair_exec_state_destroy(state);
+
+    require_ok(xair_canonicalize_module(module, &stats, &error));
+    require_ok(xair_exec_state_create(module, &state));
+    require_ok(xair_exec_run(module, entry, state, 32, &result));
+    assert(result.kind == XAIR_EXEC_HALTED_RETURN);
+    assert(result.returns[0].lo == 1);
+    assert(result.returns[6].lo == 1);
+    xair_exec_state_destroy(state);
+    xair_module_destroy(module);
+}
+
 static void test_canonicalize_removes_unused_store_and_measures_inflation(void) {
     xair_module *module = NULL;
     xair_error error;
@@ -734,6 +804,7 @@ int main(void) {
     test_canonicalize_folds_constants_and_is_idempotent();
     test_canonicalize_folds_flag_extract_and_removes_flag_summary();
     test_canonicalize_folds_logic_flag_extracts();
+    test_lazy_shift_flags_and_extra_extracts_execute();
     test_canonicalize_removes_unused_store_and_measures_inflation();
     test_exec_flags_branch();
     test_exec_memory_roundtrip();
