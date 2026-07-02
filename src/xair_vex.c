@@ -4,22 +4,31 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define XAIR_VEX_REG_DIRECT_SLOTS 4096u
+
 typedef struct {
     uint32_t key;
     xair_value_id value;
 } xair_vex_map_entry;
+
+typedef struct {
+    xair_value_id *values;
+    unsigned char *defined;
+    size_t count;
+} xair_vex_dense_map;
 
 struct xair_vex_adapter {
     xair_module *module;
     xair_block_id current;
     xair_value_id memory;
     int has_memory;
-    xair_vex_map_entry *tmps;
-    size_t tmp_count;
-    size_t tmp_cap;
-    xair_vex_map_entry *regs;
+    xair_vex_dense_map tmps;
+    xair_value_id regs[XAIR_VEX_REG_DIRECT_SLOTS];
+    unsigned char reg_defined[XAIR_VEX_REG_DIRECT_SLOTS];
     size_t reg_count;
-    size_t reg_cap;
+    xair_vex_map_entry *sparse_regs;
+    size_t sparse_reg_count;
+    size_t sparse_reg_cap;
     uint32_t continuation_index;
 };
 
@@ -47,6 +56,80 @@ static xair_status vex_grow_array(void **ptr, size_t elem_size, size_t *cap, siz
     *ptr = next;
     *cap = next_cap;
     return XAIR_OK;
+}
+
+static void vex_dense_destroy(xair_vex_dense_map *map) {
+    if (map == NULL) {
+        return;
+    }
+    free(map->values);
+    free(map->defined);
+    map->values = NULL;
+    map->defined = NULL;
+    map->count = 0;
+}
+
+static xair_status vex_dense_reserve(xair_vex_dense_map *map, uint32_t key) {
+    size_t need;
+    size_t next_count;
+    xair_value_id *next_values;
+    unsigned char *next_defined;
+    size_t i;
+
+    if (map == NULL || key == UINT32_MAX) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    need = (size_t)key + 1u;
+    if (need <= map->count) {
+        return XAIR_OK;
+    }
+    next_count = map->count ? map->count : 16u;
+    while (next_count < need) {
+        if (next_count > SIZE_MAX / 2u) {
+            return XAIR_ERR_OOM;
+        }
+        next_count *= 2u;
+    }
+    next_values = (xair_value_id *)malloc(next_count * sizeof(*next_values));
+    next_defined = (unsigned char *)calloc(next_count, sizeof(*next_defined));
+    if (next_values == NULL || next_defined == NULL) {
+        free(next_values);
+        free(next_defined);
+        return XAIR_ERR_OOM;
+    }
+    for (i = 0; i < next_count; ++i) {
+        next_values[i] = XAIR_INVALID_ID;
+    }
+    if (map->count != 0) {
+        memcpy(next_values, map->values, map->count * sizeof(*next_values));
+        memcpy(next_defined, map->defined, map->count * sizeof(*next_defined));
+    }
+    free(map->values);
+    free(map->defined);
+    map->values = next_values;
+    map->defined = next_defined;
+    map->count = next_count;
+    return XAIR_OK;
+}
+
+static xair_status vex_dense_set(xair_vex_dense_map *map, uint32_t key, xair_value_id value) {
+    xair_status status;
+
+    status = vex_dense_reserve(map, key);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    map->values[key] = value;
+    map->defined[key] = 1u;
+    return XAIR_OK;
+}
+
+static int vex_dense_get(const xair_vex_dense_map *map, uint32_t key, xair_value_id *out_value) {
+    if (map == NULL || out_value == NULL || (size_t)key >= map->count || !map->defined[key]) {
+        return 0;
+    }
+    *out_value = map->values[key];
+    return 1;
 }
 
 static xair_vex_map_entry *vex_find_entry(xair_vex_map_entry *entries, size_t count, uint32_t key) {
@@ -345,8 +428,8 @@ void xair_vex_adapter_destroy(xair_vex_adapter *adapter) {
     if (adapter == NULL) {
         return;
     }
-    free(adapter->tmps);
-    free(adapter->regs);
+    vex_dense_destroy(&adapter->tmps);
+    free(adapter->sparse_regs);
     free(adapter);
 }
 
@@ -358,23 +441,19 @@ xair_status xair_vex_set_tmp(xair_vex_adapter *adapter, uint32_t tmp, xair_value
     if (adapter == NULL || !vex_valid_value(adapter->module, value)) {
         return XAIR_ERR_BAD_ARG;
     }
-    return vex_set_entry(&adapter->tmps, &adapter->tmp_count, &adapter->tmp_cap, tmp, value);
+    return vex_dense_set(&adapter->tmps, tmp, value);
 }
 
 xair_status xair_vex_get_tmp(
     const xair_vex_adapter *adapter,
     uint32_t tmp,
     xair_value_id *out_value) {
-    const xair_vex_map_entry *entry;
-
     if (adapter == NULL || out_value == NULL) {
         return XAIR_ERR_BAD_ARG;
     }
-    entry = vex_find_entry_const(adapter->tmps, adapter->tmp_count, tmp);
-    if (entry == NULL) {
+    if (!vex_dense_get(&adapter->tmps, tmp, out_value)) {
         return XAIR_ERR_RANGE;
     }
-    *out_value = entry->value;
     return XAIR_OK;
 }
 
@@ -391,7 +470,17 @@ xair_status xair_vex_get_reg(
     if (adapter == NULL || out_value == NULL || !xair_type_is_valid(type)) {
         return XAIR_ERR_BAD_ARG;
     }
-    entry = vex_find_entry(adapter->regs, adapter->reg_count, offset);
+    if (offset < XAIR_VEX_REG_DIRECT_SLOTS && adapter->reg_defined[offset]) {
+        value = adapter->regs[offset];
+        if (!xair_type_equal(xair_value_type(adapter->module, value), type)) {
+            return XAIR_ERR_BAD_ARG;
+        }
+        *out_value = value;
+        return XAIR_OK;
+    }
+    entry = offset < XAIR_VEX_REG_DIRECT_SLOTS ?
+        NULL :
+        vex_find_entry(adapter->sparse_regs, adapter->sparse_reg_count, offset);
     if (entry != NULL) {
         if (!xair_type_equal(xair_value_type(adapter->module, entry->value), type)) {
             return XAIR_ERR_BAD_ARG;
@@ -403,9 +492,22 @@ xair_status xair_vex_get_reg(
     if (status != XAIR_OK) {
         return status;
     }
-    status = vex_set_entry(&adapter->regs, &adapter->reg_count, &adapter->reg_cap, offset, value);
-    if (status != XAIR_OK) {
-        return status;
+    if (offset < XAIR_VEX_REG_DIRECT_SLOTS) {
+        adapter->regs[offset] = value;
+        if (!adapter->reg_defined[offset]) {
+            adapter->reg_defined[offset] = 1u;
+            ++adapter->reg_count;
+        }
+    } else {
+        status = vex_set_entry(
+            &adapter->sparse_regs,
+            &adapter->sparse_reg_count,
+            &adapter->sparse_reg_cap,
+            offset,
+            value);
+        if (status != XAIR_OK) {
+            return status;
+        }
     }
     *out_value = value;
     return XAIR_OK;
@@ -415,23 +517,47 @@ xair_status xair_vex_put_reg(xair_vex_adapter *adapter, uint32_t offset, xair_va
     if (adapter == NULL || !vex_valid_value(adapter->module, value)) {
         return XAIR_ERR_BAD_ARG;
     }
-    return vex_set_entry(&adapter->regs, &adapter->reg_count, &adapter->reg_cap, offset, value);
+    if (offset < XAIR_VEX_REG_DIRECT_SLOTS) {
+        adapter->regs[offset] = value;
+        if (!adapter->reg_defined[offset]) {
+            adapter->reg_defined[offset] = 1u;
+            ++adapter->reg_count;
+        }
+        return XAIR_OK;
+    }
+    return vex_set_entry(
+        &adapter->sparse_regs,
+        &adapter->sparse_reg_count,
+        &adapter->sparse_reg_cap,
+        offset,
+        value);
 }
 
 xair_status xair_vex_peek_reg(
     const xair_vex_adapter *adapter,
     uint32_t offset,
     xair_value_id *out_value) {
-    const xair_vex_map_entry *entry;
-
     if (adapter == NULL || out_value == NULL) {
         return XAIR_ERR_BAD_ARG;
     }
-    entry = vex_find_entry_const(adapter->regs, adapter->reg_count, offset);
-    if (entry == NULL) {
-        return XAIR_ERR_RANGE;
+    if (offset < XAIR_VEX_REG_DIRECT_SLOTS) {
+        if (!adapter->reg_defined[offset]) {
+            return XAIR_ERR_RANGE;
+        }
+        *out_value = adapter->regs[offset];
+        return XAIR_OK;
     }
-    *out_value = entry->value;
+    {
+        const xair_vex_map_entry *entry = vex_find_entry_const(
+            adapter->sparse_regs,
+            adapter->sparse_reg_count,
+            offset);
+
+        if (entry == NULL) {
+            return XAIR_ERR_RANGE;
+        }
+        *out_value = entry->value;
+    }
     return XAIR_OK;
 }
 
@@ -635,7 +761,8 @@ xair_status xair_vex_emit_exit(
     xair_block_id continuation;
     xair_value_id *cont_args = NULL;
     xair_value_id *next_tmps = NULL;
-    xair_value_id *next_regs = NULL;
+    xair_value_id *next_direct_regs = NULL;
+    xair_value_id *next_sparse_regs = NULL;
     xair_value_id next_memory = XAIR_INVALID_ID;
     size_t cont_arg_count = 0;
     size_t cont_arg_cap = 0;
@@ -660,16 +787,24 @@ xair_status xair_vex_emit_exit(
     if (status != XAIR_OK) {
         return status;
     }
-    if (adapter->tmp_count != 0) {
-        next_tmps = (xair_value_id *)malloc(adapter->tmp_count * sizeof(*next_tmps));
+    if (adapter->tmps.count != 0) {
+        next_tmps = (xair_value_id *)malloc(adapter->tmps.count * sizeof(*next_tmps));
         if (next_tmps == NULL) {
             return XAIR_ERR_OOM;
         }
     }
     if (adapter->reg_count != 0) {
-        next_regs = (xair_value_id *)malloc(adapter->reg_count * sizeof(*next_regs));
-        if (next_regs == NULL) {
+        next_direct_regs = (xair_value_id *)malloc(XAIR_VEX_REG_DIRECT_SLOTS * sizeof(*next_direct_regs));
+        if (next_direct_regs == NULL) {
             free(next_tmps);
+            return XAIR_ERR_OOM;
+        }
+    }
+    if (adapter->sparse_reg_count != 0) {
+        next_sparse_regs = (xair_value_id *)malloc(adapter->sparse_reg_count * sizeof(*next_sparse_regs));
+        if (next_sparse_regs == NULL) {
+            free(next_tmps);
+            free(next_direct_regs);
             return XAIR_ERR_OOM;
         }
     }
@@ -687,20 +822,24 @@ xair_status xair_vex_emit_exit(
         if (status != XAIR_OK) {
             free(cont_args);
             free(next_tmps);
-            free(next_regs);
+            free(next_direct_regs);
+            free(next_sparse_regs);
             return status;
         }
     }
 
-    for (i = 0; i < adapter->tmp_count; ++i) {
+    for (i = 0; i < adapter->tmps.count; ++i) {
         char name[32];
 
-        (void)snprintf(name, sizeof(name), "t%u", (unsigned)adapter->tmps[i].key);
+        if (!adapter->tmps.defined[i]) {
+            continue;
+        }
+        (void)snprintf(name, sizeof(name), "t%llu", (unsigned long long)i);
         status = vex_transfer_value_to_continuation(
             adapter,
             continuation,
             name,
-            adapter->tmps[i].value,
+            adapter->tmps.values[i],
             &next_tmps[i],
             &cont_args,
             &cont_arg_count,
@@ -708,28 +847,55 @@ xair_status xair_vex_emit_exit(
         if (status != XAIR_OK) {
             free(cont_args);
             free(next_tmps);
-            free(next_regs);
+            free(next_direct_regs);
+            free(next_sparse_regs);
             return status;
         }
     }
 
-    for (i = 0; i < adapter->reg_count; ++i) {
+    for (i = 0; i < XAIR_VEX_REG_DIRECT_SLOTS; ++i) {
         char name[32];
 
-        (void)snprintf(name, sizeof(name), "r%u", (unsigned)adapter->regs[i].key);
+        if (!adapter->reg_defined[i]) {
+            continue;
+        }
+        (void)snprintf(name, sizeof(name), "r%u", (unsigned)i);
         status = vex_transfer_value_to_continuation(
             adapter,
             continuation,
             name,
-            adapter->regs[i].value,
-            &next_regs[i],
+            adapter->regs[i],
+            &next_direct_regs[i],
             &cont_args,
             &cont_arg_count,
             &cont_arg_cap);
         if (status != XAIR_OK) {
             free(cont_args);
             free(next_tmps);
-            free(next_regs);
+            free(next_direct_regs);
+            free(next_sparse_regs);
+            return status;
+        }
+    }
+
+    for (i = 0; i < adapter->sparse_reg_count; ++i) {
+        char name[32];
+
+        (void)snprintf(name, sizeof(name), "r%u", (unsigned)adapter->sparse_regs[i].key);
+        status = vex_transfer_value_to_continuation(
+            adapter,
+            continuation,
+            name,
+            adapter->sparse_regs[i].value,
+            &next_sparse_regs[i],
+            &cont_args,
+            &cont_arg_count,
+            &cont_arg_cap);
+        if (status != XAIR_OK) {
+            free(cont_args);
+            free(next_tmps);
+            free(next_direct_regs);
+            free(next_sparse_regs);
             return status;
         }
     }
@@ -747,20 +913,29 @@ xair_status xair_vex_emit_exit(
     free(cont_args);
     if (status != XAIR_OK) {
         free(next_tmps);
-        free(next_regs);
+        free(next_direct_regs);
+        free(next_sparse_regs);
         return status;
     }
     if (adapter->has_memory) {
         adapter->memory = next_memory;
     }
-    for (i = 0; i < adapter->tmp_count; ++i) {
-        adapter->tmps[i].value = next_tmps[i];
+    for (i = 0; i < adapter->tmps.count; ++i) {
+        if (adapter->tmps.defined[i]) {
+            adapter->tmps.values[i] = next_tmps[i];
+        }
     }
-    for (i = 0; i < adapter->reg_count; ++i) {
-        adapter->regs[i].value = next_regs[i];
+    for (i = 0; i < XAIR_VEX_REG_DIRECT_SLOTS; ++i) {
+        if (adapter->reg_defined[i]) {
+            adapter->regs[i] = next_direct_regs[i];
+        }
+    }
+    for (i = 0; i < adapter->sparse_reg_count; ++i) {
+        adapter->sparse_regs[i].value = next_sparse_regs[i];
     }
     free(next_tmps);
-    free(next_regs);
+    free(next_direct_regs);
+    free(next_sparse_regs);
     adapter->current = continuation;
     return XAIR_OK;
 }

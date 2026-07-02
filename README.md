@@ -17,6 +17,21 @@ Implemented pieces:
 - Raw x86-64 basic-block lifter for a benchmark-oriented instruction subset.
 - `xair_lift_raw` tool for lifting raw byte blobs into XAIR text.
 
+## Design Boundary
+
+This repository is the IR generator side of the project. CFG recovery,
+symbolic execution, taint propagation, and benchmark orchestration are separate
+layers that should consume this IR rather than being mixed into the frontend.
+
+The current module builder is still a mutable bootstrap implementation. The
+next core-IR work should freeze an immutable module format, add arena/slab
+allocation, and introduce structural value numbering before expanding symbolic
+or taint backends.
+
+Address arithmetic is intentionally explicit: integer `add`/`sub` are not valid
+for address values. Address updates must use `addr_add`, `addr_sub`,
+`int_to_addr`, and `addr_to_int`.
+
 ## Build
 
 ```sh

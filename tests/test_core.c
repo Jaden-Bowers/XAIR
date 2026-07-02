@@ -102,7 +102,48 @@ static void test_type_mismatch_is_rejected(void) {
 
     status = xair_verify_module(module, &error);
     assert(status == XAIR_ERR_VERIFY);
-    assert(strstr(error.message, "matching int or addr") != NULL);
+    assert(strstr(error.message, "matching integer") != NULL);
+    xair_module_destroy(module);
+}
+
+static void test_plain_add_rejects_addresses(void) {
+    xair_module *module = NULL;
+    xair_error error;
+    xair_block_id entry;
+    xair_value_id lhs;
+    xair_value_id rhs;
+    xair_value_id bad;
+    xair_status status;
+
+    require_ok(xair_module_create(&module));
+    require_ok(xair_block_create(module, "entry", &entry));
+    require_ok(xair_block_add_param(module, entry, xair_type_addr(64), "lhs", &lhs));
+    require_ok(xair_block_add_param(module, entry, xair_type_addr(64), "rhs", &rhs));
+    require_ok(xair_build_binary(module, entry, XAIR_OP_ADD, xair_type_addr(64), lhs, rhs, "bad", &bad));
+    require_ok(xair_set_return(module, entry, &bad, 1));
+
+    status = xair_verify_module(module, &error);
+    assert(status == XAIR_ERR_VERIFY);
+    assert(strstr(error.message, "matching integer") != NULL);
+    xair_module_destroy(module);
+}
+
+static void test_addr_add_accepts_address_and_integer(void) {
+    xair_module *module = NULL;
+    xair_error error;
+    xair_block_id entry;
+    xair_value_id base;
+    xair_value_id delta;
+    xair_value_id next;
+
+    require_ok(xair_module_create(&module));
+    require_ok(xair_block_create(module, "entry", &entry));
+    require_ok(xair_block_add_param(module, entry, xair_type_addr(64), "base", &base));
+    require_ok(xair_block_add_param(module, entry, xair_type_i(64), "delta", &delta));
+    require_ok(xair_build_binary(module, entry, XAIR_OP_ADDR_ADD, xair_type_addr(64), base, delta, "next", &next));
+    require_ok(xair_set_return(module, entry, &next, 1));
+
+    require_ok(xair_verify_module(module, &error));
     xair_module_destroy(module);
 }
 
@@ -187,6 +228,49 @@ static void test_canonicalize_folds_flag_extract_and_removes_flag_summary(void) 
     assert(strstr(text, "%zf:i1 = const.i1 0x1") != NULL);
     assert(strstr(text, "flags_add") == NULL);
     assert(stats.dead_operations_removed == 3);
+    xair_module_destroy(module);
+}
+
+static void test_canonicalize_folds_logic_flag_extracts(void) {
+    xair_module *module = NULL;
+    xair_error error;
+    xair_canonicalize_stats stats;
+    xair_block_id entry;
+    xair_value_id zero;
+    xair_value_id sign;
+    xair_value_id zero_flags;
+    xair_value_id sign_flags;
+    xair_value_id zf;
+    xair_value_id cf;
+    xair_value_id of;
+    xair_value_id sf;
+    xair_value_id returns[4];
+    char text[1536];
+
+    require_ok(xair_module_create(&module));
+    require_ok(xair_block_create(module, "entry", &entry));
+    require_ok(xair_build_const_u64(module, entry, xair_type_i(8), 0, "zero", &zero));
+    require_ok(xair_build_const_u64(module, entry, xair_type_i(8), 0x80, "sign", &sign));
+    require_ok(xair_build_unary(module, entry, XAIR_OP_FLAGS_LOGIC, xair_type_flags(6), zero, "zero_flags", &zero_flags));
+    require_ok(xair_build_unary(module, entry, XAIR_OP_FLAGS_LOGIC, xair_type_flags(6), sign, "sign_flags", &sign_flags));
+    require_ok(xair_build_unary(module, entry, XAIR_OP_FLAG_ZF, xair_type_i(1), zero_flags, "zf", &zf));
+    require_ok(xair_build_unary(module, entry, XAIR_OP_FLAG_CF, xair_type_i(1), sign_flags, "cf", &cf));
+    require_ok(xair_build_unary(module, entry, XAIR_OP_FLAG_OF, xair_type_i(1), sign_flags, "of", &of));
+    require_ok(xair_build_unary(module, entry, XAIR_OP_FLAG_SF, xair_type_i(1), sign_flags, "sf", &sf));
+    returns[0] = zf;
+    returns[1] = cf;
+    returns[2] = of;
+    returns[3] = sf;
+    require_ok(xair_set_return(module, entry, returns, 4));
+
+    require_ok(xair_canonicalize_module(module, &stats, &error));
+    require_ok(xair_format_module(module, text, sizeof(text)));
+    assert(strstr(text, "%zf:i1 = const.i1 0x1") != NULL);
+    assert(strstr(text, "%cf:i1 = const.i1 0x0") != NULL);
+    assert(strstr(text, "%of:i1 = const.i1 0x0") != NULL);
+    assert(strstr(text, "%sf:i1 = const.i1 0x1") != NULL);
+    assert(strstr(text, "flags_logic") == NULL);
+    assert(stats.constants_folded == 4);
     xair_module_destroy(module);
 }
 
@@ -373,6 +457,10 @@ static void test_vex_adapter_exit_continuation_carries_state(void) {
     xair_value_id false_value;
     xair_value_id seven;
     xair_value_id five;
+    xair_value_id direct_reg;
+    xair_value_id sparse_reg;
+    xair_value_id tmp_sum;
+    xair_value_id reg_sum;
     xair_value_id sum;
     xair_value_id side_value;
 
@@ -387,13 +475,21 @@ static void test_vex_adapter_exit_continuation_carries_state(void) {
     require_ok(xair_vex_get_tmp(adapter, 0, &false_value));
     require_ok(xair_vex_emit_const(adapter, 1, xair_type_i(64), 7, "seven"));
     require_ok(xair_vex_get_tmp(adapter, 1, &seven));
+    require_ok(xair_vex_put_reg(adapter, 16, seven));
+    require_ok(xair_vex_put_reg(adapter, 5000, seven));
     require_ok(xair_vex_emit_exit(adapter, false_value, side, NULL, 0, "cont"));
 
     require_ok(xair_vex_get_tmp(adapter, 1, &seven));
+    require_ok(xair_vex_peek_reg(adapter, 16, &direct_reg));
+    require_ok(xair_vex_peek_reg(adapter, 5000, &sparse_reg));
     require_ok(xair_vex_emit_const(adapter, 2, xair_type_i(64), 5, "five"));
     require_ok(xair_vex_get_tmp(adapter, 2, &five));
-    require_ok(xair_vex_emit_binop(adapter, 3, "Iop_Add64", seven, five, "sum"));
-    require_ok(xair_vex_get_tmp(adapter, 3, &sum));
+    require_ok(xair_vex_emit_binop(adapter, 3, "Iop_Add64", seven, five, "tmp_sum"));
+    require_ok(xair_vex_get_tmp(adapter, 3, &tmp_sum));
+    require_ok(xair_vex_emit_binop(adapter, 4, "Iop_Add64", direct_reg, sparse_reg, "reg_sum"));
+    require_ok(xair_vex_get_tmp(adapter, 4, &reg_sum));
+    require_ok(xair_vex_emit_binop(adapter, 5, "Iop_Add64", tmp_sum, reg_sum, "sum"));
+    require_ok(xair_vex_get_tmp(adapter, 5, &sum));
     require_ok(xair_vex_finish_return(adapter, &sum, 1));
 
     require_ok(xair_verify_module(module, &error));
@@ -401,7 +497,7 @@ static void test_vex_adapter_exit_continuation_carries_state(void) {
     require_ok(xair_exec_run(module, entry, state, 16, &result));
     assert(result.kind == XAIR_EXEC_HALTED_RETURN);
     assert(result.return_count == 1);
-    assert(result.returns[0].lo == 12);
+    assert(result.returns[0].lo == 26);
 
     xair_exec_state_destroy(state);
     xair_vex_adapter_destroy(adapter);
@@ -412,9 +508,12 @@ int main(void) {
     test_flags_and_branch();
     test_memory_versions();
     test_type_mismatch_is_rejected();
+    test_plain_add_rejects_addresses();
+    test_addr_add_accepts_address_and_integer();
     test_canonicalizes_commutative_order();
     test_canonicalize_folds_constants_and_is_idempotent();
     test_canonicalize_folds_flag_extract_and_removes_flag_summary();
+    test_canonicalize_folds_logic_flag_extracts();
     test_canonicalize_removes_unused_store_and_measures_inflation();
     test_exec_flags_branch();
     test_exec_memory_roundtrip();

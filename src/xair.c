@@ -428,6 +428,7 @@ const char *xair_opcode_name(xair_opcode opcode) {
     case XAIR_OP_ADDR_TO_INT: return "addr_to_int";
     case XAIR_OP_FLAGS_ADD: return "flags_add";
     case XAIR_OP_FLAGS_SUB: return "flags_sub";
+    case XAIR_OP_FLAGS_LOGIC: return "flags_logic";
     case XAIR_OP_FLAG_ZF: return "flag_zf";
     case XAIR_OP_FLAG_CF: return "flag_cf";
     case XAIR_OP_FLAG_OF: return "flag_of";
@@ -752,8 +753,8 @@ static xair_status verify_binary_op(const xair_module *module, const xair_op_rec
     switch (op->opcode) {
     case XAIR_OP_ADD:
     case XAIR_OP_SUB:
-        if (!xair_type_equal(lhs, rhs) || !(is_int(lhs) || is_addr(lhs)) || !xair_type_equal(out, lhs)) {
-            return set_error(error, block, op->dst, "%s requires matching int or addr operands", xair_opcode_name(op->opcode));
+        if (!xair_type_equal(lhs, rhs) || !is_int(lhs) || !xair_type_equal(out, lhs)) {
+            return set_error(error, block, op->dst, "%s requires matching integer operands", xair_opcode_name(op->opcode));
         }
         return XAIR_OK;
     case XAIR_OP_MUL:
@@ -833,6 +834,11 @@ static xair_status verify_unary_op(const xair_module *module, const xair_op_rec 
             return set_error(error, block, op->dst, "addr_to_int requires addrN -> iN");
         }
         return XAIR_OK;
+    case XAIR_OP_FLAGS_LOGIC:
+        if (!is_int(src) || !is_flags(out)) {
+            return set_error(error, block, op->dst, "flags_logic requires integer input and flags result");
+        }
+        return XAIR_OK;
     case XAIR_OP_FLAG_ZF:
     case XAIR_OP_FLAG_CF:
     case XAIR_OP_FLAG_OF:
@@ -894,6 +900,7 @@ static xair_status verify_op(const xair_module *module, const xair_op_rec *op, x
     case XAIR_OP_TRUNC:
     case XAIR_OP_INT_TO_ADDR:
     case XAIR_OP_ADDR_TO_INT:
+    case XAIR_OP_FLAGS_LOGIC:
     case XAIR_OP_FLAG_ZF:
     case XAIR_OP_FLAG_CF:
     case XAIR_OP_FLAG_OF:
@@ -1172,7 +1179,7 @@ static int compute_flag_extract(
     xair_type operand_type;
     uint16_t bits;
     uint64_t lhs;
-    uint64_t rhs;
+    uint64_t rhs = 0;
     uint64_t result;
     uint64_t mask;
     uint64_t sign;
@@ -1188,10 +1195,16 @@ static int compute_flag_extract(
         return 0;
     }
     flags_op = &module->ops[flags_op_id];
-    if (flags_op->opcode != XAIR_OP_FLAGS_ADD && flags_op->opcode != XAIR_OP_FLAGS_SUB) {
+    if (flags_op->opcode != XAIR_OP_FLAGS_ADD &&
+        flags_op->opcode != XAIR_OP_FLAGS_SUB &&
+        flags_op->opcode != XAIR_OP_FLAGS_LOGIC) {
         return 0;
     }
-    if (!const_u64_value(module, flags_op->src[0], &lhs) || !const_u64_value(module, flags_op->src[1], &rhs)) {
+    if (!const_u64_value(module, flags_op->src[0], &lhs)) {
+        return 0;
+    }
+    if (flags_op->opcode != XAIR_OP_FLAGS_LOGIC &&
+        !const_u64_value(module, flags_op->src[1], &rhs)) {
         return 0;
     }
 
@@ -1205,7 +1218,13 @@ static int compute_flag_extract(
     sign = sign_bit_for_bits(bits);
     lhs &= mask;
     rhs &= mask;
-    result = flags_op->opcode == XAIR_OP_FLAGS_ADD ? (lhs + rhs) & mask : (lhs - rhs) & mask;
+    if (flags_op->opcode == XAIR_OP_FLAGS_ADD) {
+        result = (lhs + rhs) & mask;
+    } else if (flags_op->opcode == XAIR_OP_FLAGS_SUB) {
+        result = (lhs - rhs) & mask;
+    } else {
+        result = lhs;
+    }
 
     lhs_sign = (lhs & sign) != 0;
     rhs_sign = (rhs & sign) != 0;
@@ -1216,10 +1235,16 @@ static int compute_flag_extract(
         *out_value = result == 0;
         return 1;
     case XAIR_OP_FLAG_CF:
-        *out_value = flags_op->opcode == XAIR_OP_FLAGS_ADD ? result < lhs : lhs < rhs;
+        if (flags_op->opcode == XAIR_OP_FLAGS_LOGIC) {
+            *out_value = 0;
+        } else {
+            *out_value = flags_op->opcode == XAIR_OP_FLAGS_ADD ? result < lhs : lhs < rhs;
+        }
         return 1;
     case XAIR_OP_FLAG_OF:
-        if (flags_op->opcode == XAIR_OP_FLAGS_ADD) {
+        if (flags_op->opcode == XAIR_OP_FLAGS_LOGIC) {
+            *out_value = 0;
+        } else if (flags_op->opcode == XAIR_OP_FLAGS_ADD) {
             *out_value = (lhs_sign == rhs_sign) && (result_sign != lhs_sign);
         } else {
             *out_value = (lhs_sign != rhs_sign) && (result_sign != lhs_sign);
@@ -2205,6 +2230,20 @@ xair_status xair_exec_get_value(
     return exec_read_value(state, value, out_value);
 }
 
+static uint64_t exec_logic_flags(uint64_t result, uint16_t bits) {
+    uint64_t mask = mask_for_bits(bits);
+    uint64_t packed = 0;
+
+    result &= mask;
+    if (result == 0) {
+        packed |= XAIR_EXEC_FLAG_ZF;
+    }
+    if ((result & sign_bit_for_bits(bits)) != 0) {
+        packed |= XAIR_EXEC_FLAG_SF;
+    }
+    return packed;
+}
+
 static uint64_t exec_flags(xair_opcode opcode, uint64_t lhs, uint64_t rhs, uint16_t bits) {
     uint64_t mask = mask_for_bits(bits);
     uint64_t sign = sign_bit_for_bits(bits);
@@ -2365,6 +2404,12 @@ static xair_status exec_unary_op(
             return XAIR_ERR_UNSUPPORTED;
         }
         result = src.lo;
+        break;
+    case XAIR_OP_FLAGS_LOGIC:
+        if (!is_flags(out) || !is_int(src.type) || src.type.bits > 64) {
+            return XAIR_ERR_UNSUPPORTED;
+        }
+        result = exec_logic_flags(src.lo, src.type.bits);
         break;
     case XAIR_OP_SEXT:
         if (!exec_scalar_u64_type(out) || !exec_scalar_u64_type(src.type)) {

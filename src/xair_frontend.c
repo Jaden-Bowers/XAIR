@@ -195,27 +195,21 @@ static xair_status x86_set_zf_from_flags(x86_lift_state *state, xair_value_id fl
 }
 
 static xair_status x86_set_zf_from_value(x86_lift_state *state, xair_value_id value) {
-    xair_value_id zero;
+    xair_value_id flags;
     xair_status status;
 
-    status = x86_build_const_u64(state, xair_type_i(64), 0, "zero", &zero);
-    if (status != XAIR_OK) {
-        return status;
-    }
-    status = xair_build_binary(
+    status = xair_build_unary(
         state->module,
         state->block,
-        XAIR_OP_EQ,
-        xair_type_i(1),
+        XAIR_OP_FLAGS_LOGIC,
+        xair_type_flags(6),
         value,
-        zero,
-        "zf",
-        &state->zf);
+        "logic_flags",
+        &flags);
     if (status != XAIR_OK) {
         return status;
     }
-    state->has_zf = 1;
-    return XAIR_OK;
+    return x86_set_zf_from_flags(state, flags);
 }
 
 static xair_status x86_const_i64(x86_lift_state *state, int64_t value, const char *name, xair_value_id *out_value) {
