@@ -106,6 +106,13 @@ xair_status xair_lift_basic_block(
     const xair_lift_options *options,
     xair_lift_result *out_result);
 
+xair_status xair_lift_block_body_into(
+    xair_module *module,
+    const xair_image *image,
+    const xair_lift_options *options,
+    xair_block_id block,
+    xair_lift_result *out_result);
+
 #ifdef __cplusplus
 }
 #endif

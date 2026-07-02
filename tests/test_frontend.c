@@ -385,6 +385,36 @@ static void test_lift_x86_32_mov_add_ret_executes(void) {
     xair_module_destroy(module);
 }
 
+static void test_lift_block_body_into_existing_block(void) {
+    static const uint8_t bytes[] = {
+        0x48, 0xb8, 0x2a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xc3
+    };
+    xair_image image;
+    xair_lift_options options;
+    xair_lift_result lift;
+    xair_error error;
+    xair_module *module = NULL;
+    xair_block_id block;
+
+    require_ok(xair_image_init(&image, bytes, sizeof(bytes), 0x9000));
+    memset(&options, 0, sizeof(options));
+    options.arch = XAIR_ARCH_X86_64;
+    options.address = 0x9000;
+    options.max_instructions = 4;
+
+    require_ok(xair_module_create(&module));
+    require_ok(xair_block_create(module, "cfg_owned_block", &block));
+    require_ok(xair_lift_block_body_into(module, &image, &options, block, &lift));
+    assert(lift.block == block);
+    assert(lift.end_kind == XAIR_LIFT_END_RETURN);
+    assert(lift.return_count == 1);
+    require_ok(xair_set_return(module, block, lift.return_values, lift.return_count));
+    require_ok(xair_verify_module(module, &error));
+
+    xair_module_destroy(module);
+}
+
 int main(void) {
     test_lift_mov_add_ret_executes();
     test_lift_jz_metadata_and_condition();
@@ -395,5 +425,6 @@ int main(void) {
     test_lift_unsupported_is_explicit();
     test_lift_non_rex64_form_is_unsupported();
     test_lift_x86_32_mov_add_ret_executes();
+    test_lift_block_body_into_existing_block();
     return 0;
 }

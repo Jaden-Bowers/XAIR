@@ -14,6 +14,7 @@ typedef struct {
     xair_arch arch;
     xair_block_id block;
     uint64_t pc;
+    int emit_return_terminator;
     uint16_t reg_bits;
     uint16_t addr_bits;
     uint64_t stack_bytes;
@@ -632,6 +633,9 @@ static xair_status x86_finish_block(x86_lift_state *state) {
             return status;
         }
     }
+    if (!state->emit_return_terminator) {
+        return XAIR_OK;
+    }
     return xair_set_return(
         state->module,
         state->block,
@@ -1089,6 +1093,9 @@ static xair_status lift_x86_basic_block(
     xair_module *module,
     const xair_image *image,
     const xair_lift_options *options,
+    xair_block_id existing_block,
+    int use_existing_block,
+    int emit_return_terminator,
     xair_lift_result *out_result) {
     x86_lift_state state;
     char generated_name[40];
@@ -1106,6 +1113,7 @@ static xair_status lift_x86_basic_block(
     state.arch = options->arch;
     state.decoder = options->decoder == NULL ? xair_x86_default_decoder() : options->decoder;
     state.pc = options->address;
+    state.emit_return_terminator = emit_return_terminator;
     state.reg_bits = options->arch == XAIR_ARCH_X86_64 ? 64u : 32u;
     state.addr_bits = state.reg_bits;
     state.stack_bytes = options->arch == XAIR_ARCH_X86_64 ? 8u : 4u;
@@ -1113,7 +1121,10 @@ static xair_status lift_x86_basic_block(
     state.memory = XAIR_INVALID_ID;
     state.zf = XAIR_INVALID_ID;
 
-    if (options->block_name == NULL || options->block_name[0] == '\0') {
+    if (use_existing_block) {
+        state.block = existing_block;
+        status = XAIR_OK;
+    } else if (options->block_name == NULL || options->block_name[0] == '\0') {
         (void)snprintf(
             generated_name,
             sizeof(generated_name),
@@ -1168,5 +1179,32 @@ xair_status xair_lift_basic_block(
     }
     (void)offset;
     lift_result_init(out_result);
-    return lift_x86_basic_block(module, image, options, out_result);
+    return lift_x86_basic_block(module, image, options, XAIR_INVALID_ID, 0, 1, out_result);
+}
+
+xair_status xair_lift_block_body_into(
+    xair_module *module,
+    const xair_image *image,
+    const xair_lift_options *options,
+    xair_block_id block,
+    xair_lift_result *out_result) {
+    size_t offset;
+
+    if (module == NULL || image == NULL || options == NULL || out_result == NULL ||
+        image->bytes == NULL ||
+        (options->arch != XAIR_ARCH_X86_64 && options->arch != XAIR_ARCH_X86_32) ||
+        block >= xair_module_block_count(module)) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    if (options->decoder != NULL &&
+        ((options->arch == XAIR_ARCH_X86_64 && options->decoder->decode64 == NULL) ||
+            (options->arch == XAIR_ARCH_X86_32 && options->decoder->decode32 == NULL))) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    if (!image_offset(image, options->address, &offset)) {
+        return XAIR_ERR_RANGE;
+    }
+    (void)offset;
+    lift_result_init(out_result);
+    return lift_x86_basic_block(module, image, options, block, 1, 0, out_result);
 }
