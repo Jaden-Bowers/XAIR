@@ -9,6 +9,8 @@ summaries, and no opaque helper calls in optimized hot paths.
 
 Current status: Phase 5B benchmark-ready binary-to-IR frontend prototype.
 
+IR version: XAIR v0.1.0.
+
 Implemented pieces:
 - Core XAIR module, verifier, formatter, and metrics.
 - Canonicalization pass.
@@ -31,6 +33,9 @@ or taint backends.
 Address arithmetic is intentionally explicit: integer `add`/`sub` are not valid
 for address values. Address updates must use `addr_add`, `addr_sub`,
 `int_to_addr`, and `addr_to_int`.
+
+The v0 IR text format is covered by golden tests. Changes to opcode semantics,
+type rules, or printed IR should be treated as versioned changes.
 
 ## Build
 

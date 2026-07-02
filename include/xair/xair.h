@@ -9,6 +9,9 @@ extern "C" {
 #endif
 
 #define XAIR_INVALID_ID UINT32_MAX
+#define XAIR_IR_VERSION_MAJOR 0u
+#define XAIR_IR_VERSION_MINOR 1u
+#define XAIR_IR_VERSION_PATCH 0u
 
 typedef uint32_t xair_value_id;
 typedef uint32_t xair_block_id;
@@ -146,6 +149,8 @@ int xair_type_is_valid(xair_type type);
 
 const char *xair_status_name(xair_status status);
 const char *xair_opcode_name(xair_opcode opcode);
+const char *xair_ir_version_string(void);
+uint32_t xair_ir_version_u32(void);
 
 xair_status xair_module_create(xair_module **out_module);
 void xair_module_destroy(xair_module *module);

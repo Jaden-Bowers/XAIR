@@ -12,6 +12,123 @@ static void require_ok(xair_status status) {
     }
 }
 
+static void require_text_equal(const char *actual, const char *expected) {
+    if (strcmp(actual, expected) != 0) {
+        fprintf(stderr, "unexpected text:\n%s\nexpected:\n%s\n", actual, expected);
+        assert(strcmp(actual, expected) == 0);
+    }
+}
+
+static void test_ir_version_is_v0(void) {
+    assert(XAIR_IR_VERSION_MAJOR == 0u);
+    assert(strcmp(xair_ir_version_string(), "0.1.0") == 0);
+    assert(xair_ir_version_u32() == 0x00000100u);
+}
+
+static void test_v0_golden_addr_and_flags_text(void) {
+    static const char expected[] =
+        "entry(%base:addr64, %delta:i64, %value:i64):\n"
+        "  %addr:addr64 = addr_add.addr64 %base, %delta\n"
+        "  %flags:flags6 = flags_logic.i64 %value\n"
+        "  %zf:i1 = flag_zf.flags6 %flags\n"
+        "  return (%addr, %zf)\n"
+        "\n";
+    xair_module *module = NULL;
+    xair_error error;
+    xair_block_id entry;
+    xair_value_id base;
+    xair_value_id delta;
+    xair_value_id value;
+    xair_value_id addr;
+    xair_value_id flags;
+    xair_value_id zf;
+    xair_value_id returns[2];
+    char text[1024];
+
+    require_ok(xair_module_create(&module));
+    require_ok(xair_block_create(module, "entry", &entry));
+    require_ok(xair_block_add_param(module, entry, xair_type_addr(64), "base", &base));
+    require_ok(xair_block_add_param(module, entry, xair_type_i(64), "delta", &delta));
+    require_ok(xair_block_add_param(module, entry, xair_type_i(64), "value", &value));
+    require_ok(xair_build_binary(module, entry, XAIR_OP_ADDR_ADD, xair_type_addr(64), base, delta, "addr", &addr));
+    require_ok(xair_build_unary(module, entry, XAIR_OP_FLAGS_LOGIC, xair_type_flags(6), value, "flags", &flags));
+    require_ok(xair_build_unary(module, entry, XAIR_OP_FLAG_ZF, xair_type_i(1), flags, "zf", &zf));
+    returns[0] = addr;
+    returns[1] = zf;
+    require_ok(xair_set_return(module, entry, returns, 2));
+
+    require_ok(xair_verify_module(module, &error));
+    require_ok(xair_format_module(module, text, sizeof(text)));
+    require_text_equal(text, expected);
+    xair_module_destroy(module);
+}
+
+static void test_v0_verifier_rejects_bad_memory_token(void) {
+    xair_module *module = NULL;
+    xair_error error;
+    xair_block_id entry;
+    xair_value_id not_memory;
+    xair_value_id addr;
+    xair_value_id loaded;
+    xair_status status;
+
+    require_ok(xair_module_create(&module));
+    require_ok(xair_block_create(module, "entry", &entry));
+    require_ok(xair_block_add_param(module, entry, xair_type_i(64), "not_memory", &not_memory));
+    require_ok(xair_block_add_param(module, entry, xair_type_addr(64), "addr", &addr));
+    require_ok(xair_build_load(module, entry, xair_type_i(32), not_memory, addr, XAIR_ENDIAN_LE, "loaded", &loaded));
+    require_ok(xair_set_return(module, entry, &loaded, 1));
+
+    status = xair_verify_module(module, &error);
+    assert(status == XAIR_ERR_VERIFY);
+    assert(strstr(error.message, "memory operation requires") != NULL);
+    xair_module_destroy(module);
+}
+
+static void test_v0_verifier_rejects_bad_branch_condition(void) {
+    xair_module *module = NULL;
+    xair_error error;
+    xair_block_id entry;
+    xair_block_id taken;
+    xair_block_id fall;
+    xair_value_id condition;
+    xair_status status;
+
+    require_ok(xair_module_create(&module));
+    require_ok(xair_block_create(module, "entry", &entry));
+    require_ok(xair_block_create(module, "taken", &taken));
+    require_ok(xair_block_create(module, "fall", &fall));
+    require_ok(xair_block_add_param(module, entry, xair_type_i(32), "condition", &condition));
+    require_ok(xair_set_return(module, taken, NULL, 0));
+    require_ok(xair_set_return(module, fall, NULL, 0));
+    require_ok(xair_set_cbranch(module, entry, condition, taken, NULL, 0, fall, NULL, 0));
+
+    status = xair_verify_module(module, &error);
+    assert(status == XAIR_ERR_VERIFY);
+    assert(strstr(error.message, "conditional branch requires available i1 condition") != NULL);
+    xair_module_destroy(module);
+}
+
+static void test_v0_verifier_rejects_bad_flag_extract(void) {
+    xair_module *module = NULL;
+    xair_error error;
+    xair_block_id entry;
+    xair_value_id not_flags;
+    xair_value_id zf;
+    xair_status status;
+
+    require_ok(xair_module_create(&module));
+    require_ok(xair_block_create(module, "entry", &entry));
+    require_ok(xair_block_add_param(module, entry, xair_type_i(64), "not_flags", &not_flags));
+    require_ok(xair_build_unary(module, entry, XAIR_OP_FLAG_ZF, xair_type_i(1), not_flags, "zf", &zf));
+    require_ok(xair_set_return(module, entry, &zf, 1));
+
+    status = xair_verify_module(module, &error);
+    assert(status == XAIR_ERR_VERIFY);
+    assert(strstr(error.message, "requires flags input") != NULL);
+    xair_module_destroy(module);
+}
+
 static void test_flags_and_branch(void) {
     xair_module *module = NULL;
     xair_error error;
@@ -505,6 +622,11 @@ static void test_vex_adapter_exit_continuation_carries_state(void) {
 }
 
 int main(void) {
+    test_ir_version_is_v0();
+    test_v0_golden_addr_and_flags_text();
+    test_v0_verifier_rejects_bad_memory_token();
+    test_v0_verifier_rejects_bad_branch_condition();
+    test_v0_verifier_rejects_bad_flag_extract();
     test_flags_and_branch();
     test_memory_versions();
     test_type_mismatch_is_rejected();

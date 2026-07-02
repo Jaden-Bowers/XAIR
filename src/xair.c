@@ -6,6 +6,7 @@
 #include <string.h>
 
 #define XAIR_NAME_LEN 32
+#define XAIR_IR_VERSION_TEXT "0.1.0"
 
 typedef enum {
     XAIR_TERM_NONE = 0,
@@ -437,6 +438,16 @@ const char *xair_opcode_name(xair_opcode opcode) {
     case XAIR_OP_STORE: return "store";
     default: return "unknown";
     }
+}
+
+const char *xair_ir_version_string(void) {
+    return XAIR_IR_VERSION_TEXT;
+}
+
+uint32_t xair_ir_version_u32(void) {
+    return (XAIR_IR_VERSION_MAJOR << 16u) |
+        (XAIR_IR_VERSION_MINOR << 8u) |
+        XAIR_IR_VERSION_PATCH;
 }
 
 xair_status xair_module_create(xair_module **out_module) {
