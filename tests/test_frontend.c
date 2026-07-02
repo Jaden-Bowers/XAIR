@@ -70,8 +70,11 @@ static void test_lift_mov_add_ret_executes(void) {
     options.max_instructions = 8;
 
     require_ok(xair_module_create(&module));
+    options.decoder = xair_x86_default_decoder();
     require_ok(xair_lift_basic_block(module, &image, &options, &lift));
     assert(lift.end_kind == XAIR_LIFT_END_RETURN);
+    assert(strcmp(xair_x86_decoder_name(options.decoder), "x86_stub") == 0);
+    assert(strcmp(lift.decoder_name, "x86_stub") == 0);
     assert(lift.instructions == 4);
     assert(lift.bytes_read == sizeof(bytes));
     rax = output_reg_value(&lift, XAIR_X86_RAX);

@@ -75,9 +75,19 @@ typedef struct {
     xair_x86_operand operands[XAIR_X86_DECODE_MAX_OPERANDS];
 } xair_x86_decoded_inst;
 
+struct xair_x86_decoder_backend {
+    const char *name;
+    xair_status (*decode64)(
+        const uint8_t *bytes,
+        size_t size,
+        xair_x86_decoded_inst *out_inst);
+};
+
 xair_status xair_x86_decode64(
     const uint8_t *bytes,
     size_t size,
     xair_x86_decoded_inst *out_inst);
+
+const xair_x86_decoder_backend *xair_x86_stub_decoder(void);
 
 #endif

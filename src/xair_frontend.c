@@ -10,6 +10,7 @@ typedef struct {
     xair_module *module;
     const xair_image *image;
     xair_lift_result *result;
+    const xair_x86_decoder_backend *decoder;
     xair_block_id block;
     uint64_t pc;
     uint16_t memory_space;
@@ -89,6 +90,17 @@ const char *xair_x86_reg_name(xair_x86_reg reg) {
         return "invalid";
     }
     return x86_reg_names[reg];
+}
+
+const xair_x86_decoder_backend *xair_x86_default_decoder(void) {
+    return xair_x86_stub_decoder();
+}
+
+const char *xair_x86_decoder_name(const xair_x86_decoder_backend *decoder) {
+    if (decoder == NULL) {
+        decoder = xair_x86_default_decoder();
+    }
+    return decoder->name == NULL ? "unknown" : decoder->name;
 }
 
 static int image_offset(const xair_image *image, uint64_t address, size_t *out_offset) {
@@ -956,7 +968,7 @@ static xair_status x86_lift_one(x86_lift_state *state, int *out_done) {
     if (!image_offset(state->image, inst_start, &offset)) {
         return XAIR_ERR_RANGE;
     }
-    status = xair_x86_decode64(state->image->bytes + offset, state->image->size - offset, &inst);
+    status = state->decoder->decode64(state->image->bytes + offset, state->image->size - offset, &inst);
     if (status == XAIR_ERR_UNSUPPORTED) {
         return x86_finish_unsupported(state, inst_start, inst.raw_opcode);
     }
@@ -1059,6 +1071,7 @@ static xair_status lift_x86_64_basic_block(
     state.module = module;
     state.image = image;
     state.result = out_result;
+    state.decoder = options->decoder == NULL ? xair_x86_default_decoder() : options->decoder;
     state.pc = options->address;
     state.memory_space = options->memory_space;
     state.memory = XAIR_INVALID_ID;
@@ -1080,6 +1093,7 @@ static xair_status lift_x86_64_basic_block(
 
     out_result->block = state.block;
     out_result->start = options->address;
+    out_result->decoder_name = xair_x86_decoder_name(state.decoder);
     max_instructions = options->max_instructions == 0 ? 32u : options->max_instructions;
 
     while (state.instructions < max_instructions) {
@@ -1105,6 +1119,9 @@ xair_status xair_lift_basic_block(
 
     if (module == NULL || image == NULL || options == NULL || out_result == NULL ||
         image->bytes == NULL || options->arch != XAIR_ARCH_X86_64) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    if (options->decoder != NULL && options->decoder->decode64 == NULL) {
         return XAIR_ERR_BAD_ARG;
     }
     if (!image_offset(image, options->address, &offset)) {

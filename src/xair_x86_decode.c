@@ -610,3 +610,12 @@ xair_status xair_x86_decode64(
         return decode_unsupported(out_inst, opcode, 0);
     }
 }
+
+static const xair_x86_decoder_backend xair_x86_stub_decoder_backend = {
+    "x86_stub",
+    xair_x86_decode64
+};
+
+const xair_x86_decoder_backend *xair_x86_stub_decoder(void) {
+    return &xair_x86_stub_decoder_backend;
+}

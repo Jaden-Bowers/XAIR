@@ -48,6 +48,10 @@ from inflating the IR before canonicalization runs.
 Lazy flags cover add, sub, logic, and shift-left summaries, with extractors for
 ZF, CF, OF, SF, PF, and AF.
 
+The x86 lifter consumes a decoder backend interface. The current backend is the
+private `x86_stub` decoder, and future Zydis, XED, or generated-table decoders
+can be added without rewriting the lifter.
+
 ## Build
 
 ```sh

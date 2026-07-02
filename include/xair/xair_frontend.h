@@ -48,12 +48,15 @@ typedef struct {
     uint64_t base;
 } xair_image;
 
+typedef struct xair_x86_decoder_backend xair_x86_decoder_backend;
+
 typedef struct {
     xair_arch arch;
     uint64_t address;
     uint16_t memory_space;
     size_t max_instructions;
     const char *block_name;
+    const xair_x86_decoder_backend *decoder;
 } xair_lift_options;
 
 typedef struct {
@@ -70,6 +73,7 @@ typedef struct {
     uint64_t fallthrough;
     uint64_t unsupported_address;
     uint8_t unsupported_opcode;
+    const char *decoder_name;
     size_t bytes_read;
     size_t instructions;
     xair_value_id memory_in;
@@ -92,6 +96,8 @@ xair_status xair_image_init(
 const char *xair_arch_name(xair_arch arch);
 const char *xair_lift_end_kind_name(xair_lift_end_kind kind);
 const char *xair_x86_reg_name(xair_x86_reg reg);
+const xair_x86_decoder_backend *xair_x86_default_decoder(void);
+const char *xair_x86_decoder_name(const xair_x86_decoder_backend *decoder);
 
 xair_status xair_lift_basic_block(
     xair_module *module,

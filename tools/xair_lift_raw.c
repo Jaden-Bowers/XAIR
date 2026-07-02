@@ -105,6 +105,7 @@ static void print_lift_result(const xair_lift_result *result) {
     size_t i;
 
     printf("lift.end=%s\n", xair_lift_end_kind_name(result->end_kind));
+    printf("lift.decoder=%s\n", result->decoder_name == NULL ? "unknown" : result->decoder_name);
     printf("lift.start=0x%llx\n", (unsigned long long)result->start);
     printf("lift.next=0x%llx\n", (unsigned long long)result->next);
     printf("lift.bytes=%llu\n", (unsigned long long)result->bytes_read);
