@@ -11,7 +11,8 @@ extern "C" {
 #define XAIR_LIFT_MAX_RETURNS 24
 
 typedef enum {
-    XAIR_ARCH_X86_64 = 1
+    XAIR_ARCH_X86_32 = 1,
+    XAIR_ARCH_X86_64 = 2
 } xair_arch;
 
 typedef enum {

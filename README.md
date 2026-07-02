@@ -7,8 +7,8 @@ The design target is narrower than a compiler IR and more explicit than VEX:
 typed SSA values, byte-addressed memory, explicit memory versions, lazy flag
 summaries, and no opaque helper calls in optimized hot paths.
 
-Current status: Phase 5C benchmark-readiness hardening for the binary-to-IR
-frontend prototype.
+Current status: binary-to-IR frontend prototype with raw byte, PE, and ELF
+entry lifting paths.
 
 IR version: XAIR v0.1.0.
 
@@ -17,8 +17,10 @@ Implemented pieces:
 - Canonicalization pass.
 - Concrete C executor baseline.
 - VEX-shaped adapter layer.
-- Raw x86-64 basic-block lifter for a benchmark-oriented instruction subset.
+- Raw x86-32 and x86-64 basic-block lifter for a benchmark-oriented
+  instruction subset.
 - `xair_lift_raw` tool for lifting raw byte blobs into XAIR text.
+- `xair_lift_bin` tool for lifting the entry block from PE and ELF binaries.
 - `xair_bench_lift` tool for in-process lift timing over benchmark cases.
 
 ## Design Boundary
@@ -53,8 +55,14 @@ Lazy flags cover add, sub, logic, and shift-left summaries, with extractors for
 ZF, CF, OF, SF, PF, and AF.
 
 The x86 lifter consumes a decoder backend interface. The current backend is the
-private `x86_stub` decoder, and future Zydis, XED, or generated-table decoders
-can be added without rewriting the lifter.
+private `x86_stub` decoder for x86-32 and x86-64, and future Zydis, XED, or
+generated-table decoders can be added without rewriting the lifter.
+
+The binary loader recognizes PE32, PE32+, ELF32, and ELF64 for x86 targets. It
+copies the executable section or load segment containing the requested entry
+address and lifts one basic block from that image slice. This is intentionally
+not a full operating-system loader: relocations, imports, TLS, and full process
+memory layout belong in the later CFG and execution layers.
 
 For benchmark harnesses, XAIR exposes `xair_module_fingerprint`, JSON output
 from `xair_lift_raw --json`, and a small corpus runner named `xair_case_run`.
@@ -86,27 +94,29 @@ cmake --build build-wsl-release
 ctest --test-dir build-wsl-release --output-on-failure
 ```
 
-## Raw Lift Tool
+## Lift Tools
 
 ```sh
-build/Debug/xair_lift_raw.exe <raw-binary> <base> <entry> [max-instructions]
-build/Debug/xair_lift_raw.exe --json <raw-binary> <base> <entry> [max-instructions]
+build/Debug/xair_lift_raw.exe [--json] [--arch x86_64|x86_32] <raw-binary> <base> <entry> [max-instructions]
+build/Debug/xair_lift_bin.exe [--json] <pe-or-elf> [entry-va] [max-instructions]
 build/Debug/xair_case_run.exe <case-file>
 build/Debug/xair_bench_lift.exe --repeat 1000 --warmup 100 <case-file>...
 ```
 
-This tool expects a raw byte blob, not a PE/ELF/Mach-O file. It prints lift
-metadata and the generated XAIR block. CFG construction is intentionally left
-for a later separate project that consumes this frontend.
+`xair_lift_raw` expects a raw byte blob and explicit base and entry addresses.
+`xair_lift_bin` reads a PE or ELF binary, detects x86-32 or x86-64, extracts
+the entry section or segment, and prints lift metadata plus the generated XAIR
+block. CFG construction is intentionally left for a later separate project that
+consumes this frontend.
 
 The frontend reports block input registers, output registers, memory tokens,
 branch metadata, and generated XAIR so lift speed and IR inflation can be
 benchmarked separately from CFG recovery.
 
 `xair_bench_lift` is the preferred timing path. It keeps the process alive,
-loads benchmark cases once, repeats lifting in a tight loop, and reports JSONL
-rows with lift, canonicalize, freeze, fingerprint, value-numbering, and final
-module metrics.
+loads benchmark cases once, warms the case bytes, repeats lifting in a tight
+loop, and reports JSONL rows with lift, canonicalize, freeze, fingerprint,
+value-numbering, and final module metrics.
 
 ## Attribution
 

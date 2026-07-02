@@ -23,6 +23,7 @@ typedef struct {
     uint64_t base;
     uint64_t entry;
     size_t max_instructions;
+    xair_arch arch;
     int have_arch;
     int have_bytes;
     int have_base;
@@ -128,11 +129,22 @@ static int parse_hex_bytes(const char *text, uint8_t **out_bytes, size_t *out_si
 
 static void bench_case_init(bench_case *config) {
     memset(config, 0, sizeof(*config));
+    config->arch = XAIR_ARCH_X86_64;
     config->max_instructions = 32;
 }
 
 static void bench_case_destroy(bench_case *config) {
     free(config->bytes);
+}
+
+static void warm_case_bytes(const bench_case *config) {
+    volatile uint64_t sink = 0;
+    size_t i;
+
+    for (i = 0; i < config->byte_count; ++i) {
+        sink ^= ((uint64_t)config->bytes[i]) << ((i & 7u) * 8u);
+    }
+    (void)sink;
 }
 
 static int parse_case_line(bench_case *config, char *line) {
@@ -153,7 +165,15 @@ static int parse_case_line(bench_case *config, char *line) {
     value = trim(value);
 
     if (strcmp(key, "arch") == 0) {
-        config->have_arch = strcmp(value, "x86_64") == 0;
+        if (strcmp(value, "x86_64") == 0) {
+            config->arch = XAIR_ARCH_X86_64;
+            config->have_arch = 1;
+        } else if (strcmp(value, "x86_32") == 0 || strcmp(value, "x86") == 0 || strcmp(value, "i386") == 0) {
+            config->arch = XAIR_ARCH_X86_32;
+            config->have_arch = 1;
+        } else {
+            config->have_arch = 0;
+        }
         return config->have_arch;
     }
     if (strcmp(key, "base") == 0) {
@@ -325,7 +345,7 @@ static xair_status bench_once(
         return status;
     }
     memset(&lift_options, 0, sizeof(lift_options));
-    lift_options.arch = XAIR_ARCH_X86_64;
+    lift_options.arch = config->arch;
     lift_options.address = config->entry;
     lift_options.max_instructions = config->max_instructions;
 
@@ -509,6 +529,7 @@ int main(int argc, char **argv) {
             bench_case_destroy(&config);
             return 1;
         }
+        warm_case_bytes(&config);
         for (i = 0; i < options.warmup; ++i) {
             if (bench_once(argv[argi], &config, &options, i, 0) != XAIR_OK) {
                 exit_code = 1;

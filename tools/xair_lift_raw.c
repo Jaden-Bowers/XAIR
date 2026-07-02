@@ -74,7 +74,7 @@ static int read_file(const char *path, uint8_t **out_bytes, size_t *out_size) {
 }
 
 static void print_usage(const char *argv0) {
-    fprintf(stderr, "usage: %s [--json] <raw-binary> <base> <entry> [max-instructions]\n", argv0);
+    fprintf(stderr, "usage: %s [--json] [--arch x86_64|x86_32] <raw-binary> <base> <entry> [max-instructions]\n", argv0);
 }
 
 static int format_and_print_module(const xair_module *module) {
@@ -176,6 +176,7 @@ static void print_json_value_numbering(const char *name, const xair_value_number
 static void print_json_lift_result(
     const xair_module *module,
     const xair_lift_result *result,
+    xair_arch arch,
     const xair_value_numbering_stats *construction_value_numbers) {
     xair_module_metrics metrics;
     xair_value_numbering_stats final_value_numbers;
@@ -188,7 +189,7 @@ static void print_json_lift_result(
     printf("  \"status\": \"ok\",\n");
     printf("  \"verified\": true,\n");
     printf("  \"ir_version\": \"%s\",\n", xair_ir_version_string());
-    printf("  \"arch\": \"x86_64\",\n");
+    printf("  \"arch\": \"%s\",\n", xair_arch_name(arch));
     printf("  \"decoder\": \"%s\",\n", result->decoder_name == NULL ? "unknown" : result->decoder_name);
     printf("  \"end\": \"%s\",\n", xair_lift_end_kind_name(result->end_kind));
     printf("  \"start\": %llu,\n", (unsigned long long)result->start);
@@ -229,13 +230,34 @@ int main(int argc, char **argv) {
     xair_module *module = NULL;
     xair_value_numbering_stats construction_value_numbers;
     xair_status status;
+    xair_arch arch = XAIR_ARCH_X86_64;
     int exit_code = 1;
     int json = 0;
     int argi = 1;
 
-    if (argc > 1 && strcmp(argv[1], "--json") == 0) {
-        json = 1;
-        argi = 2;
+    while (argi < argc && strncmp(argv[argi], "--", 2) == 0) {
+        if (strcmp(argv[argi], "--json") == 0) {
+            json = 1;
+            ++argi;
+        } else if (strcmp(argv[argi], "--arch") == 0) {
+            if (argi + 1 >= argc) {
+                print_usage(argv[0]);
+                return 1;
+            }
+            if (strcmp(argv[argi + 1], "x86_64") == 0) {
+                arch = XAIR_ARCH_X86_64;
+            } else if (strcmp(argv[argi + 1], "x86_32") == 0 || strcmp(argv[argi + 1], "x86") == 0 ||
+                strcmp(argv[argi + 1], "i386") == 0) {
+                arch = XAIR_ARCH_X86_32;
+            } else {
+                print_usage(argv[0]);
+                return 1;
+            }
+            argi += 2;
+        } else {
+            print_usage(argv[0]);
+            return 1;
+        }
     }
     if (argc - argi < 3 || argc - argi > 4) {
         print_usage(argv[0]);
@@ -262,7 +284,7 @@ int main(int argc, char **argv) {
         goto done;
     }
     memset(&options, 0, sizeof(options));
-    options.arch = XAIR_ARCH_X86_64;
+    options.arch = arch;
     options.address = entry;
     options.max_instructions = max_instructions;
 
@@ -283,7 +305,7 @@ int main(int argc, char **argv) {
         goto done;
     }
     if (json) {
-        print_json_lift_result(module, &result, &construction_value_numbers);
+        print_json_lift_result(module, &result, arch, &construction_value_numbers);
     } else {
         print_lift_result(&result);
         if (!format_and_print_module(module)) {

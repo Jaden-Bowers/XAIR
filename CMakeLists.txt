@@ -32,6 +32,7 @@ function(xair_keep_asserts target)
 endfunction()
 
 add_library(xair STATIC
+    src/xair_binary.c
     src/xair.c
     src/xair_frontend.c
     src/xair_x86_decode.c
@@ -88,7 +89,19 @@ add_executable(xair_bench_lift
 target_link_libraries(xair_bench_lift PRIVATE xair)
 xair_apply_warnings(xair_bench_lift)
 
+add_executable(xair_lift_bin
+    tools/xair_lift_bin.c
+)
+
+target_link_libraries(xair_lift_bin PRIVATE xair)
+xair_apply_warnings(xair_lift_bin)
+
 add_test(
     NAME xair_case_run_smoke
     COMMAND xair_case_run ${CMAKE_CURRENT_SOURCE_DIR}/tests/cases/mov_ret.xaircase
+)
+
+add_test(
+    NAME xair_lift_bin_smoke
+    COMMAND xair_lift_bin --json $<TARGET_FILE:xair_lift_bin>
 )

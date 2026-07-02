@@ -344,6 +344,47 @@ static void test_lift_non_rex64_form_is_unsupported(void) {
     xair_module_destroy(module);
 }
 
+static void test_lift_x86_32_mov_add_ret_executes(void) {
+    static const uint8_t bytes[] = {
+        0xb8, 0x28, 0x00, 0x00, 0x00,
+        0xbb, 0x02, 0x00, 0x00, 0x00,
+        0x01, 0xd8,
+        0xc3
+    };
+    xair_image image;
+    xair_lift_options options;
+    xair_lift_result lift;
+    xair_module *module = NULL;
+    xair_exec_state *state = NULL;
+    xair_exec_result exec;
+    xair_value_id eax;
+    size_t eax_index;
+
+    require_ok(xair_image_init(&image, bytes, sizeof(bytes), 0x1000));
+    memset(&options, 0, sizeof(options));
+    options.arch = XAIR_ARCH_X86_32;
+    options.address = 0x1000;
+    options.max_instructions = 8;
+
+    require_ok(xair_module_create(&module));
+    require_ok(xair_lift_basic_block(module, &image, &options, &lift));
+    assert(lift.end_kind == XAIR_LIFT_END_RETURN);
+    assert(lift.instructions == 4);
+    assert(lift.bytes_read == sizeof(bytes));
+    eax = output_reg_value(&lift, XAIR_X86_RAX);
+    assert(xair_value_type(module, eax).bits == 32);
+    eax_index = return_index_for_value(&lift, eax);
+
+    require_ok(xair_exec_state_create(module, &state));
+    require_ok(xair_exec_run(module, lift.block, state, 8, &exec));
+    assert(exec.kind == XAIR_EXEC_HALTED_RETURN);
+    assert(exec.returns[eax_index].type.bits == 32);
+    assert(exec.returns[eax_index].lo == 42);
+
+    xair_exec_state_destroy(state);
+    xair_module_destroy(module);
+}
+
 int main(void) {
     test_lift_mov_add_ret_executes();
     test_lift_jz_metadata_and_condition();
@@ -353,5 +394,6 @@ int main(void) {
     test_lift_stack_frame_memory_executes();
     test_lift_unsupported_is_explicit();
     test_lift_non_rex64_form_is_unsupported();
+    test_lift_x86_32_mov_add_ret_executes();
     return 0;
 }

@@ -77,11 +77,20 @@ typedef struct {
 
 struct xair_x86_decoder_backend {
     const char *name;
+    xair_status (*decode32)(
+        const uint8_t *bytes,
+        size_t size,
+        xair_x86_decoded_inst *out_inst);
     xair_status (*decode64)(
         const uint8_t *bytes,
         size_t size,
         xair_x86_decoded_inst *out_inst);
 };
+
+xair_status xair_x86_decode32(
+    const uint8_t *bytes,
+    size_t size,
+    xair_x86_decoded_inst *out_inst);
 
 xair_status xair_x86_decode64(
     const uint8_t *bytes,
