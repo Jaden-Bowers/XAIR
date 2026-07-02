@@ -162,11 +162,27 @@ static void print_json_reg_values(const char *name, const xair_lift_reg_value *r
     printf("],\n");
 }
 
-static void print_json_lift_result(const xair_module *module, const xair_lift_result *result) {
+static void print_json_value_numbering(const char *name, const xair_value_numbering_stats *stats, int trailing_comma) {
+    printf(
+        "  \"%s\": {\"entries\": %llu, \"created\": %llu, \"reused\": %llu, \"collisions\": %llu}%s\n",
+        name,
+        (unsigned long long)stats->entries,
+        (unsigned long long)stats->created,
+        (unsigned long long)stats->reused,
+        (unsigned long long)stats->collisions,
+        trailing_comma ? "," : "");
+}
+
+static void print_json_lift_result(
+    const xair_module *module,
+    const xair_lift_result *result,
+    const xair_value_numbering_stats *construction_value_numbers) {
     xair_module_metrics metrics;
+    xair_value_numbering_stats final_value_numbers;
     uint64_t fingerprint = 0;
 
     (void)xair_get_module_metrics(module, &metrics);
+    (void)xair_get_value_numbering_stats(module, &final_value_numbers);
     (void)xair_module_fingerprint(module, &fingerprint);
     printf("{\n");
     printf("  \"status\": \"ok\",\n");
@@ -194,6 +210,8 @@ static void print_json_lift_result(const xair_module *module, const xair_lift_re
         (unsigned long long)metrics.operations,
         (unsigned long long)metrics.block_parameters,
         (unsigned long long)metrics.terminator_arguments);
+    print_json_value_numbering("value_numbering_construction", construction_value_numbers, 1);
+    print_json_value_numbering("value_numbering_final", &final_value_numbers, 1);
     printf("  \"fingerprint\": \"0x%016llx\"\n", (unsigned long long)fingerprint);
     printf("}\n");
 }
@@ -209,6 +227,7 @@ int main(int argc, char **argv) {
     xair_lift_result result;
     xair_error error;
     xair_module *module = NULL;
+    xair_value_numbering_stats construction_value_numbers;
     xair_status status;
     int exit_code = 1;
     int json = 0;
@@ -257,8 +276,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "verify failed: %s\n", error.message);
         goto done;
     }
+    (void)xair_get_value_numbering_stats(module, &construction_value_numbers);
+    status = xair_module_freeze(module);
+    if (status != XAIR_OK) {
+        fprintf(stderr, "freeze failed: %s\n", xair_status_name(status));
+        goto done;
+    }
     if (json) {
-        print_json_lift_result(module, &result);
+        print_json_lift_result(module, &result, &construction_value_numbers);
     } else {
         print_lift_result(&result);
         if (!format_and_print_module(module)) {

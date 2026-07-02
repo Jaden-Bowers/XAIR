@@ -335,6 +335,16 @@ static void print_json_u64_array(const xair_exec_result *exec) {
     printf("],\n");
 }
 
+static void print_json_value_numbering(const char *name, const xair_value_numbering_stats *stats) {
+    printf(
+        "  \"%s\": {\"entries\": %llu, \"created\": %llu, \"reused\": %llu, \"collisions\": %llu},\n",
+        name,
+        (unsigned long long)stats->entries,
+        (unsigned long long)stats->created,
+        (unsigned long long)stats->reused,
+        (unsigned long long)stats->collisions);
+}
+
 static void print_execution_json(const xair_lift_result *lift, const xair_exec_result *exec) {
     size_t i;
 
@@ -377,6 +387,8 @@ int main(int argc, char **argv) {
     xair_exec_state *state = NULL;
     xair_exec_result exec;
     xair_module_metrics metrics;
+    xair_value_numbering_stats construction_value_numbers;
+    xair_value_numbering_stats final_value_numbers;
     xair_error error;
     uint64_t fingerprint = 0;
     xair_status status;
@@ -418,7 +430,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "verify failed: %s\n", error.message);
         goto done;
     }
+    (void)xair_get_value_numbering_stats(module, &construction_value_numbers);
+    status = xair_module_freeze(module);
+    if (status != XAIR_OK) {
+        fprintf(stderr, "freeze failed: %s\n", xair_status_name(status));
+        goto done;
+    }
     (void)xair_get_module_metrics(module, &metrics);
+    (void)xair_get_value_numbering_stats(module, &final_value_numbers);
     (void)xair_module_fingerprint(module, &fingerprint);
 
     do_execute = can_execute(&config, &lift, &skip_reason);
@@ -487,6 +506,8 @@ int main(int argc, char **argv) {
         (unsigned long long)metrics.operations,
         (unsigned long long)metrics.block_parameters,
         (unsigned long long)metrics.terminator_arguments);
+    print_json_value_numbering("value_numbering_construction", &construction_value_numbers);
+    print_json_value_numbering("value_numbering_final", &final_value_numbers);
     printf("  \"fingerprint\": \"0x%016llx\",\n", (unsigned long long)fingerprint);
     if (do_execute) {
         print_execution_json(&lift, &exec);

@@ -87,6 +87,7 @@ static void test_builder_freeze_makes_module_immutable(void) {
     xair_module *frozen = NULL;
     xair_error error;
     xair_canonicalize_stats stats;
+    xair_value_numbering_stats vn_stats;
     xair_block_id entry;
     xair_block_id extra;
     xair_value_id value;
@@ -100,10 +101,15 @@ static void test_builder_freeze_makes_module_immutable(void) {
     require_ok(xair_block_create(module, "entry", &entry));
     require_ok(xair_build_const_u64(module, entry, xair_type_i(64), 7, "value", &value));
     require_ok(xair_set_return(module, entry, &value, 1));
+    require_ok(xair_get_value_numbering_stats(module, &vn_stats));
+    assert(vn_stats.entries == 1);
     require_ok(xair_builder_freeze(builder, &frozen));
     assert(frozen == module);
     assert(xair_builder_module(builder) == NULL);
     assert(xair_module_is_frozen(frozen));
+    require_ok(xair_get_value_numbering_stats(frozen, &vn_stats));
+    assert(vn_stats.entries == 0);
+    assert(vn_stats.created == 1);
 
     require_ok(xair_verify_module(frozen, &error));
     require_ok(xair_format_module(frozen, text, sizeof(text)));
@@ -114,6 +120,43 @@ static void test_builder_freeze_makes_module_immutable(void) {
 
     xair_builder_destroy(builder);
     xair_module_destroy(frozen);
+}
+
+static void test_global_constant_pool_reuses_across_blocks(void) {
+    xair_module *module = NULL;
+    xair_exec_state *state = NULL;
+    xair_exec_result result;
+    xair_error error;
+    xair_value_numbering_stats stats;
+    xair_block_id entry;
+    xair_block_id next;
+    xair_value_id zero0;
+    xair_value_id zero1;
+
+    require_ok(xair_module_create(&module));
+    require_ok(xair_block_create(module, "entry", &entry));
+    require_ok(xair_block_create(module, "next", &next));
+
+    require_ok(xair_build_const_u64(module, entry, xair_type_i(64), 0, "zero0", &zero0));
+    require_ok(xair_set_jump(module, entry, next, NULL, 0));
+    require_ok(xair_build_const_u64(module, next, xair_type_i(64), 0, "zero1", &zero1));
+    require_ok(xair_set_return(module, next, &zero1, 1));
+
+    assert(zero0 == zero1);
+    assert(xair_module_op_count(module) == 1);
+    require_ok(xair_get_value_numbering_stats(module, &stats));
+    assert(stats.entries == 1);
+    assert(stats.created == 1);
+    assert(stats.reused == 1);
+    require_ok(xair_verify_module(module, &error));
+
+    require_ok(xair_exec_state_create(module, &state));
+    require_ok(xair_exec_run(module, next, state, 16, &result));
+    assert(result.kind == XAIR_EXEC_HALTED_RETURN);
+    assert(result.return_count == 1);
+    assert(result.returns[0].lo == 0);
+    xair_exec_state_destroy(state);
+    xair_module_destroy(module);
 }
 
 static void test_v0_verifier_rejects_bad_memory_token(void) {
@@ -375,6 +418,8 @@ static void test_structural_value_numbering_reuses_nodes(void) {
     require_ok(xair_get_value_numbering_stats(module, &stats));
     assert(stats.entries == 0);
     assert(stats.reused == 5);
+    assert(canon_stats.value_number_entries_before == 5);
+    assert(canon_stats.value_number_entries_after == 0);
     xair_module_destroy(module);
 }
 
@@ -810,6 +855,7 @@ int main(void) {
     test_module_fingerprint_is_stable_and_structural();
     test_v0_golden_addr_and_flags_text();
     test_builder_freeze_makes_module_immutable();
+    test_global_constant_pool_reuses_across_blocks();
     test_v0_verifier_rejects_bad_memory_token();
     test_v0_verifier_rejects_bad_branch_condition();
     test_v0_verifier_rejects_bad_flag_extract();

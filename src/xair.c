@@ -119,6 +119,33 @@ static xair_status grow_array(void **ptr, size_t elem_size, size_t *cap, size_t 
     return XAIR_OK;
 }
 
+static xair_status shrink_array(void **ptr, size_t elem_size, size_t *cap, size_t count) {
+    void *next;
+
+    if (ptr == NULL || cap == NULL) {
+        return XAIR_ERR_BAD_ARG;
+    }
+    if (count == 0) {
+        free(*ptr);
+        *ptr = NULL;
+        *cap = 0;
+        return XAIR_OK;
+    }
+    if (*cap == count) {
+        return XAIR_OK;
+    }
+    if (elem_size != 0 && count > SIZE_MAX / elem_size) {
+        return XAIR_ERR_OOM;
+    }
+    next = realloc(*ptr, count * elem_size);
+    if (next == NULL) {
+        return XAIR_ERR_OOM;
+    }
+    *ptr = next;
+    *cap = count;
+    return XAIR_OK;
+}
+
 static void copy_name(char dst[XAIR_NAME_LEN], const char *src, const char *prefix, uint32_t id) {
     if (src != NULL && src[0] != '\0') {
         (void)snprintf(dst, XAIR_NAME_LEN, "%s", src);
@@ -133,6 +160,22 @@ static int valid_block(const xair_module *module, xair_block_id block) {
 
 static int valid_value(const xair_module *module, xair_value_id value) {
     return module != NULL && value < module->value_count;
+}
+
+static int value_is_global_const(const xair_module *module, xair_value_id value) {
+    xair_op_id op_id;
+
+    if (!valid_value(module, value)) {
+        return 0;
+    }
+    op_id = module->values[value].op;
+    return op_id != XAIR_INVALID_ID &&
+        op_id < module->op_count &&
+        module->ops[op_id].opcode == XAIR_OP_CONST_U64;
+}
+
+static int value_is_available(const xair_module *module, const unsigned char *available, xair_value_id value) {
+    return valid_value(module, value) && (available[value] || value_is_global_const(module, value));
 }
 
 static const xair_value_id *term_args_const(
@@ -226,6 +269,10 @@ static int type_same(xair_type lhs, xair_type rhs) {
     return lhs.kind == rhs.kind && lhs.bits == rhs.bits && lhs.aux == rhs.aux;
 }
 
+static int value_number_is_global(xair_opcode opcode) {
+    return opcode == XAIR_OP_CONST_U64;
+}
+
 static uint64_t value_number_hash(
     xair_block_id block,
     xair_opcode opcode,
@@ -237,7 +284,7 @@ static uint64_t value_number_hash(
     uint64_t hash = UINT64_C(1469598103934665603);
     uint8_t i;
 
-    hash = hash_mix_u64(hash, (uint64_t)block);
+    hash = hash_mix_u64(hash, value_number_is_global(opcode) ? UINT64_MAX : (uint64_t)block);
     hash = hash_mix_u64(hash, (uint64_t)opcode);
     hash = hash_type(hash, type);
     hash = hash_mix_u64(hash, (uint64_t)src_count);
@@ -263,8 +310,10 @@ static int value_number_matches(
     xair_op_id op_id;
     uint8_t i;
 
-    if (!valid_value(module, value) || module->values[value].block != block ||
-        !type_same(module->values[value].type, type)) {
+    if (!valid_value(module, value) || !type_same(module->values[value].type, type)) {
+        return 0;
+    }
+    if (!value_number_is_global(opcode) && module->values[value].block != block) {
         return 0;
     }
     op_id = module->values[value].op;
@@ -731,19 +780,70 @@ xair_module *xair_builder_module(xair_builder *builder) {
     return builder == NULL ? NULL : builder->module;
 }
 
+static xair_status finalize_block_storage(xair_block_rec *block) {
+    xair_status status;
+
+    status = shrink_array((void **)&block->params, sizeof(*block->params), &block->param_cap, block->param_count);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    return shrink_array((void **)&block->ops, sizeof(*block->ops), &block->op_cap, block->op_count);
+}
+
+static xair_status finalize_module_storage(xair_module *module) {
+    xair_status status;
+    size_t i;
+
+    for (i = 0; i < module->block_count; ++i) {
+        status = finalize_block_storage(&module->blocks[i]);
+        if (status != XAIR_OK) {
+            return status;
+        }
+    }
+    status = shrink_array((void **)&module->term_args, sizeof(*module->term_args), &module->term_arg_cap, module->term_arg_count);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    status = shrink_array((void **)&module->values, sizeof(*module->values), &module->value_cap, module->value_count);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    status = shrink_array((void **)&module->ops, sizeof(*module->ops), &module->op_cap, module->op_count);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    status = shrink_array((void **)&module->blocks, sizeof(*module->blocks), &module->block_cap, module->block_count);
+    if (status != XAIR_OK) {
+        return status;
+    }
+    value_number_clear(module);
+    return XAIR_OK;
+}
+
 xair_status xair_builder_freeze(xair_builder *builder, xair_module **out_module) {
+    xair_status status;
+
     if (builder == NULL || out_module == NULL || builder->module == NULL) {
         return XAIR_ERR_BAD_ARG;
     }
-    builder->module->frozen = 1;
+    status = xair_module_freeze(builder->module);
+    if (status != XAIR_OK) {
+        return status;
+    }
     *out_module = builder->module;
     builder->module = NULL;
     return XAIR_OK;
 }
 
 xair_status xair_module_freeze(xair_module *module) {
+    xair_status status;
+
     if (module == NULL || module->frozen) {
         return XAIR_ERR_BAD_ARG;
+    }
+    status = finalize_module_storage(module);
+    if (status != XAIR_OK) {
+        return status;
     }
     module->frozen = 1;
     return XAIR_OK;
@@ -1269,7 +1369,7 @@ static xair_status verify_target_args(
     for (i = 0; i < arg_count; ++i) {
         xair_value_id arg = args[i];
         xair_value_id param = target_block->params[i];
-        if (!valid_value(module, arg) || !available[arg]) {
+        if (!value_is_available(module, available, arg)) {
             return set_error(error, src_block, arg, "terminator argument is not available in source block");
         }
         if (!xair_type_equal(module->values[arg].type, module->values[param].type)) {
@@ -1300,8 +1400,7 @@ static xair_status verify_term(
             block->term.true_arg_count,
             error);
     case XAIR_TERM_CBRANCH:
-        if (!valid_value(module, block->term.condition) ||
-            !available[block->term.condition] ||
+        if (!value_is_available(module, available, block->term.condition) ||
             !is_i1(module->values[block->term.condition].type)) {
             return set_error(error, block_id, block->term.condition, "conditional branch requires available i1 condition");
         }
@@ -1326,7 +1425,7 @@ static xair_status verify_term(
     case XAIR_TERM_RETURN:
         for (i = 0; i < block->term.true_arg_count; ++i) {
             xair_value_id value = term_args_const(module, &block->term, 0)[i];
-            if (!valid_value(module, value) || !available[value]) {
+            if (!value_is_available(module, available, value)) {
                 return set_error(error, block_id, value, "return value is not available in source block");
             }
         }
@@ -1383,7 +1482,7 @@ xair_status xair_verify_module(const xair_module *module, xair_error *error) {
             }
             for (src_i = 0; src_i < op->src_count; ++src_i) {
                 xair_value_id src = op->src[src_i];
-                if (!valid_value(module, src) || !available[src]) {
+                if (!value_is_available(module, available, src)) {
                     free(available);
                     return set_error(error, (xair_block_id)block_id, src, "operation source is not available in block");
                 }
@@ -1542,6 +1641,10 @@ static uint64_t truncate_to_type(uint64_t value, xair_type type) {
     return value & mask_for_bits(type.bits);
 }
 
+static uint64_t bool_u64(int value) {
+    return value ? UINT64_C(1) : UINT64_C(0);
+}
+
 static int const_u64_value(const xair_module *module, xair_value_id value, uint64_t *out_value) {
     xair_op_id op_id;
     const xair_op_rec *op;
@@ -1668,7 +1771,7 @@ static int compute_flag_extract(
 
     switch (extract_opcode) {
     case XAIR_OP_FLAG_ZF:
-        *out_value = result == 0;
+        *out_value = bool_u64(result == 0);
         return 1;
     case XAIR_OP_FLAG_CF:
         if (flags_op->opcode == XAIR_OP_FLAGS_LOGIC) {
@@ -1676,7 +1779,7 @@ static int compute_flag_extract(
         } else if (flags_op->opcode == XAIR_OP_FLAGS_SHL) {
             *out_value = (lhs >> (bits - rhs)) & 1u;
         } else {
-            *out_value = flags_op->opcode == XAIR_OP_FLAGS_ADD ? result < lhs : lhs < rhs;
+            *out_value = bool_u64(flags_op->opcode == XAIR_OP_FLAGS_ADD ? result < lhs : lhs < rhs);
         }
         return 1;
     case XAIR_OP_FLAG_OF:
@@ -1686,24 +1789,24 @@ static int compute_flag_extract(
             if (rhs != 1) {
                 return 0;
             }
-            *out_value = result_sign != (((lhs >> (bits - rhs)) & 1u) != 0);
+            *out_value = bool_u64(result_sign != (((lhs >> (bits - rhs)) & 1u) != 0));
         } else if (flags_op->opcode == XAIR_OP_FLAGS_ADD) {
-            *out_value = (lhs_sign == rhs_sign) && (result_sign != lhs_sign);
+            *out_value = bool_u64((lhs_sign == rhs_sign) && (result_sign != lhs_sign));
         } else {
-            *out_value = (lhs_sign != rhs_sign) && (result_sign != lhs_sign);
+            *out_value = bool_u64((lhs_sign != rhs_sign) && (result_sign != lhs_sign));
         }
         return 1;
     case XAIR_OP_FLAG_SF:
-        *out_value = result_sign;
+        *out_value = bool_u64(result_sign);
         return 1;
     case XAIR_OP_FLAG_PF:
-        *out_value = even_parity8(result);
+        *out_value = bool_u64(even_parity8(result));
         return 1;
     case XAIR_OP_FLAG_AF:
         if (flags_op->opcode == XAIR_OP_FLAGS_LOGIC || flags_op->opcode == XAIR_OP_FLAGS_SHL) {
             *out_value = 0;
         } else {
-            *out_value = ((lhs ^ rhs ^ result) & 0x10u) != 0;
+            *out_value = bool_u64(((lhs ^ rhs ^ result) & 0x10u) != 0);
         }
         return 1;
     default:
@@ -1786,12 +1889,12 @@ static int fold_constant_op(xair_module *module, xair_op_rec *op) {
         lhs &= mask_for_bits(lhs_type.bits);
         rhs &= mask_for_bits(lhs_type.bits);
         switch (op->opcode) {
-        case XAIR_OP_EQ: folded = lhs == rhs; break;
-        case XAIR_OP_NE: folded = lhs != rhs; break;
-        case XAIR_OP_ULT: folded = lhs < rhs; break;
-        case XAIR_OP_ULE: folded = lhs <= rhs; break;
-        case XAIR_OP_SLT: folded = signed_less_u64(lhs, rhs, lhs_type.bits); break;
-        default: folded = signed_less_u64(lhs, rhs, lhs_type.bits) || lhs == rhs; break;
+        case XAIR_OP_EQ: folded = bool_u64(lhs == rhs); break;
+        case XAIR_OP_NE: folded = bool_u64(lhs != rhs); break;
+        case XAIR_OP_ULT: folded = bool_u64(lhs < rhs); break;
+        case XAIR_OP_ULE: folded = bool_u64(lhs <= rhs); break;
+        case XAIR_OP_SLT: folded = bool_u64(signed_less_u64(lhs, rhs, lhs_type.bits)); break;
+        default: folded = bool_u64(signed_less_u64(lhs, rhs, lhs_type.bits) || lhs == rhs); break;
         }
         fold_to_const(op, folded, out);
         return 1;
@@ -2144,6 +2247,7 @@ xair_status xair_canonicalize_module(
     memset(&stats, 0, sizeof(stats));
     stats.values_before = module->value_count;
     stats.operations_before = module->op_count;
+    stats.value_number_entries_before = module->value_number_count;
 
     status = xair_verify_module(module, error);
     if (status != XAIR_OK) {
@@ -2164,6 +2268,7 @@ xair_status xair_canonicalize_module(
 
     stats.values_after = module->value_count;
     stats.operations_after = module->op_count;
+    stats.value_number_entries_after = module->value_number_count;
     if (out_stats != NULL) {
         *out_stats = stats;
     }
@@ -2463,6 +2568,13 @@ static xair_status exec_read_value(
         return status;
     }
     if (!state->defined[value]) {
+        if (value_is_global_const(state->module, value)) {
+            xair_op_id op_id = state->module->values[value].op;
+            const xair_op_rec *op = &state->module->ops[op_id];
+
+            *out_value = exec_value_make(state->module->values[value].type, op->imm, 0);
+            return XAIR_OK;
+        }
         return XAIR_ERR_BAD_ARG;
     }
     *out_value = state->values[value];
@@ -2839,22 +2951,22 @@ static xair_status exec_binary_op(
         }
         break;
     case XAIR_OP_EQ:
-        result = lhs.lo == rhs.lo;
+        result = bool_u64(lhs.lo == rhs.lo);
         break;
     case XAIR_OP_NE:
-        result = lhs.lo != rhs.lo;
+        result = bool_u64(lhs.lo != rhs.lo);
         break;
     case XAIR_OP_ULT:
-        result = lhs.lo < rhs.lo;
+        result = bool_u64(lhs.lo < rhs.lo);
         break;
     case XAIR_OP_ULE:
-        result = lhs.lo <= rhs.lo;
+        result = bool_u64(lhs.lo <= rhs.lo);
         break;
     case XAIR_OP_SLT:
-        result = signed_less_u64(lhs.lo, rhs.lo, lhs.type.bits);
+        result = bool_u64(signed_less_u64(lhs.lo, rhs.lo, lhs.type.bits));
         break;
     case XAIR_OP_SLE:
-        result = signed_less_u64(lhs.lo, rhs.lo, lhs.type.bits) || lhs.lo == rhs.lo;
+        result = bool_u64(signed_less_u64(lhs.lo, rhs.lo, lhs.type.bits) || lhs.lo == rhs.lo);
         break;
     case XAIR_OP_CONCAT:
         if (!is_int(out) || out.bits > 64 || rhs.type.bits >= 64) {
@@ -2927,27 +3039,27 @@ static xair_status exec_unary_op(
         break;
     case XAIR_OP_FLAG_ZF:
         flag = XAIR_EXEC_FLAG_ZF;
-        result = (src.lo & flag) != 0;
+        result = bool_u64((src.lo & flag) != 0);
         break;
     case XAIR_OP_FLAG_CF:
         flag = XAIR_EXEC_FLAG_CF;
-        result = (src.lo & flag) != 0;
+        result = bool_u64((src.lo & flag) != 0);
         break;
     case XAIR_OP_FLAG_OF:
         flag = XAIR_EXEC_FLAG_OF;
-        result = (src.lo & flag) != 0;
+        result = bool_u64((src.lo & flag) != 0);
         break;
     case XAIR_OP_FLAG_SF:
         flag = XAIR_EXEC_FLAG_SF;
-        result = (src.lo & flag) != 0;
+        result = bool_u64((src.lo & flag) != 0);
         break;
     case XAIR_OP_FLAG_PF:
         flag = XAIR_EXEC_FLAG_PF;
-        result = (src.lo & flag) != 0;
+        result = bool_u64((src.lo & flag) != 0);
         break;
     case XAIR_OP_FLAG_AF:
         flag = XAIR_EXEC_FLAG_AF;
-        result = (src.lo & flag) != 0;
+        result = bool_u64((src.lo & flag) != 0);
         break;
     default:
         return XAIR_ERR_UNSUPPORTED;

@@ -7,7 +7,8 @@ The design target is narrower than a compiler IR and more explicit than VEX:
 typed SSA values, byte-addressed memory, explicit memory versions, lazy flag
 summaries, and no opaque helper calls in optimized hot paths.
 
-Current status: Phase 5B benchmark-ready binary-to-IR frontend prototype.
+Current status: Phase 5C benchmark-readiness hardening for the binary-to-IR
+frontend prototype.
 
 IR version: XAIR v0.1.0.
 
@@ -25,10 +26,11 @@ This repository is the IR generator side of the project. CFG recovery,
 symbolic execution, taint propagation, and benchmark orchestration are separate
 layers that should consume this IR rather than being mixed into the frontend.
 
-The current construction path is still a mutable bootstrap implementation, but
-it now has an explicit freeze boundary. The remaining core-IR work is to move
-more variable-length data into arenas or slabs and keep improving structural
-value numbering before expanding symbolic or taint backends.
+The current construction path is still a mutable bootstrap implementation. The
+freeze boundary now finalizes the module enough for benchmarking: mutable growth
+buffers are shrunk to their used size, per-block arrays are compacted, and the
+construction value-numbering table is discarded. A later packed immutable module
+format can replace this without changing the external v0 IR contract.
 
 New code can build through `xair_builder`, then freeze the result with
 `xair_builder_freeze` or `xair_module_freeze`. Frozen modules reject mutation
@@ -41,9 +43,10 @@ for address values. Address updates must use `addr_add`, `addr_sub`,
 The v0 IR text format is covered by golden tests. Changes to opcode semantics,
 type rules, or printed IR should be treated as versioned changes.
 
-Construction performs local structural value numbering for equivalent constants,
-unary nodes, binary nodes, loads, and stores. This keeps repeated expressions
-from inflating the IR before canonicalization runs.
+Construction performs structural value numbering for constants, unary nodes,
+binary nodes, loads, and stores. Constants are pooled globally across blocks.
+Non-constant expressions remain block-local, which keeps the current dominance
+model simple and avoids unsafe global CSE.
 
 Lazy flags cover add, sub, logic, and shift-left summaries, with extractors for
 ZF, CF, OF, SF, PF, and AF.
@@ -54,8 +57,10 @@ can be added without rewriting the lifter.
 
 For benchmark harnesses, XAIR exposes `xair_module_fingerprint`, JSON output
 from `xair_lift_raw --json`, and a small corpus runner named `xair_case_run`.
-The runner accepts key-value case files with raw bytes, base address, entry
-address, optional register inputs, and optional memory bytes.
+The JSON output reports construction value-numbering separately from final
+value-numbering so freeze-time table cleanup is visible. The runner accepts
+key-value case files with raw bytes, base address, entry address, optional
+register inputs, and optional memory bytes.
 
 ## Build
 
@@ -63,6 +68,13 @@ address, optional register inputs, and optional memory bytes.
 cmake -S . -B build
 cmake --build build
 ctest --test-dir build --output-on-failure
+```
+
+For strict local cleanup with MSVC, GCC, or Clang:
+
+```sh
+cmake -S . -B build-strict -DXAIR_STRICT_WARNINGS=ON
+cmake --build build-strict
 ```
 
 ## Raw Lift Tool

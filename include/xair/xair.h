@@ -107,6 +107,8 @@ typedef struct {
     size_t values_after;
     size_t operations_before;
     size_t operations_after;
+    size_t value_number_entries_before;
+    size_t value_number_entries_after;
     size_t operands_reordered;
     size_t constants_folded;
     size_t dead_values_removed;

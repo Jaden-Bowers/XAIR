@@ -6,6 +6,23 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
+option(XAIR_STRICT_WARNINGS "Treat extended compiler warnings as errors" OFF)
+
+function(xair_apply_warnings target)
+    if(MSVC)
+        target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
+        target_compile_options(${target} PRIVATE /W4)
+        if(XAIR_STRICT_WARNINGS)
+            target_compile_options(${target} PRIVATE /WX)
+        endif()
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+        if(XAIR_STRICT_WARNINGS)
+            target_compile_options(${target} PRIVATE -Wconversion -Wsign-conversion -Werror)
+        endif()
+    endif()
+endfunction()
+
 add_library(xair STATIC
     src/xair.c
     src/xair_frontend.c
@@ -18,11 +35,7 @@ target_include_directories(xair
         ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-if(MSVC)
-    target_compile_options(xair PRIVATE /W4)
-else()
-    target_compile_options(xair PRIVATE -Wall -Wextra -Wpedantic)
-endif()
+xair_apply_warnings(xair)
 
 enable_testing()
 
@@ -31,6 +44,7 @@ add_executable(xair_core_tests
 )
 
 target_link_libraries(xair_core_tests PRIVATE xair)
+xair_apply_warnings(xair_core_tests)
 
 add_test(NAME xair_core_tests COMMAND xair_core_tests)
 
@@ -39,6 +53,7 @@ add_executable(xair_frontend_tests
 )
 
 target_link_libraries(xair_frontend_tests PRIVATE xair)
+xair_apply_warnings(xair_frontend_tests)
 
 add_test(NAME xair_frontend_tests COMMAND xair_frontend_tests)
 
@@ -47,12 +62,14 @@ add_executable(xair_lift_raw
 )
 
 target_link_libraries(xair_lift_raw PRIVATE xair)
+xair_apply_warnings(xair_lift_raw)
 
 add_executable(xair_case_run
     tools/xair_case_run.c
 )
 
 target_link_libraries(xair_case_run PRIVATE xair)
+xair_apply_warnings(xair_case_run)
 
 add_test(
     NAME xair_case_run_smoke
